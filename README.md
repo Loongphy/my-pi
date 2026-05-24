@@ -2,6 +2,8 @@
 
 A collection of [pi](https://pi.dev) extensions for an enhanced coding experience.
 
+![Screenshot](https://github.com/user-attachments/assets/e8766ffd-3ff5-474b-a876-3b8f78bfd069)
+
 ## Quick Start
 
 Copy the prompt below and paste it into your pi editor, then press Enter:
