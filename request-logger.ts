@@ -37,6 +37,45 @@ function cleanupOldLogs(): void {
 }
 
 // ============================================================
+// 429 rate-limit workaround for opencode.ai
+// See: https://github.com/earendil-works/pi/issues/3671
+// See: https://github.com/earendil-works/pi/issues/4666
+// ============================================================
+
+/** Parse retry-after: integer seconds, HTTP-date, or retry-after-ms. */
+function parseRetryAfter(
+  retryAfter: string | null,
+  retryAfterMs: string | null,
+): number | null {
+  if (retryAfterMs) {
+    const ms = Number(retryAfterMs);
+    if (Number.isFinite(ms) && ms > 0) return Math.ceil(ms / 1000);
+  }
+  if (!retryAfter) return null;
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds);
+  const date = new Date(retryAfter);
+  if (!Number.isNaN(date.getTime())) {
+    const diffMs = date.getTime() - Date.now();
+    return diffMs > 0 ? Math.ceil(diffMs / 1000) : 0;
+  }
+  return null;
+}
+
+/** Format seconds → "3h 59m", "2m 30s", "45s". */
+function formatTime(seconds: number): string {
+  if (seconds <= 0) return "now";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  const parts: string[] = [];
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0) parts.push(`${m}m`);
+  if (s > 0 || parts.length === 0) parts.push(`${s}s`);
+  return parts.join(" ");
+}
+
+// ============================================================
 // Helpers
 // ============================================================
 
@@ -226,9 +265,40 @@ if (typeof _underlyingFetch === "function") {
         }
 
         try {
-          const response = await _underlyingFetch.call(globalThis, input, init);
+          let response = await _underlyingFetch.call(globalThis, input, init);
 
-          if (isProviderReq && !isDuplicate) {
+          // Log original 429 before rewriting (so logs show real status)
+          const isRateLimited = response.status === 429 && url.includes("opencode.ai");
+          if (isProviderReq && !isDuplicate && isRateLimited) {
+            const respHeaders: Record<string, string> = {};
+            response.headers.forEach((v, k) => { respHeaders[k] = v; });
+            const rhLines = Object.entries(respHeaders)
+              .map(([k, v]) => `    ${k.padEnd(24)} ${v}`)
+              .join("\n");
+            appendLog(
+              `[${ts}] RESPONSE 429 (rewritten to 400 by rate-limit workaround)` +
+              `\n│ header:\n${rhLines}\n└─`
+            );
+          }
+
+          // 429 workaround for opencode.ai: rewrite to 400 with reset time
+          // SDK sleeps for exact retry-after with no cap, causing pi to hang.
+          if (isRateLimited) {
+            const seconds = parseRetryAfter(
+              response.headers.get("retry-after"),
+              response.headers.get("retry-after-ms"),
+            );
+            const limitMs = seconds != null && seconds > 0 ? seconds * 1000 : 60_000;
+            const timeStr = formatTime(Math.ceil(limitMs / 1000));
+            response = new Response(`Usage limit reached: Resets in ${timeStr}`, {
+              status: 400,
+              statusText: "Usage Limited",
+              headers: { "content-type": "text/plain" },
+            });
+          }
+
+          // Skip logging rewritten 400 (already logged original 429 above)
+          if (isProviderReq && !isDuplicate && !isRateLimited) {
             const respHeaders: Record<string, string> = {};
             response.headers.forEach((v, k) => { respHeaders[k] = v; });
 

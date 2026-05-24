@@ -79,6 +79,29 @@ A comprehensive status bar suite with multiple modules:
 
 ---
 
+## 429 Rate-Limit Workaround (OpenCode)
+
+> **Temporary workaround** for SDK 429 retry hang, integrated into `request-logger.ts`.
+>
+> **Related issues:**
+> - [pi#3671](https://github.com/earendil-works/pi/issues/3671) — Copilot provider hangs on long Retry-Afters
+> - [pi#4666](https://github.com/earendil-works/pi/issues/4666) — 429 Retry-After waits ignore `maxRetryDelayMs`; Esc and /new do not recover
+>
+> **The problem:** When a provider returns HTTP 429 with a large `retry-after`
+> header, the underlying SDK (OpenAI, Anthropic) sleeps for that exact duration
+> with no upper bound. The sleep is not abort-aware — **Esc cannot cancel it**,
+> `/new` breaks the session, and the only recovery is restarting pi.
+>
+> **What it does:** Intercepts `fetch()` on 429 responses from `opencode.ai`
+> providers only. Parses the `retry-after` header, returns a 400 with a
+> human-readable message (`Usage limit reached: Resets in 2h 5m`), and avoids
+> pi's retry-trigger keywords so the error displays once without entering a
+> retry loop.
+>
+> **Remove this workaround once the upstream issue is fixed.**
+
+---
+
 ## Pi Internals
 
 You do **not** need any extension to replace `find`/`grep` with `fd`/`rg` — pi already handles this internally. The tool names exposed to the LLM are `find` and `grep` for semantic clarity, but the actual work is done by `fd` and `rg`.
