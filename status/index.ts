@@ -12,6 +12,8 @@
  * Hides the built-in footer to avoid duplication.
  */
 
+import fs from "node:fs";
+import path from "node:path";
 import { complete } from "@earendil-works/pi-ai";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type {
@@ -31,7 +33,7 @@ import {
   TokenSpeedEngine,
 } from "./header.ts";
 import { registerStatuslineCommand } from "./statusline.ts";
-import type { GitStatus, StatusLineConfig, HeaderRenderData } from "./header.ts";
+import type { GitStatus, StatusLineConfig } from "./header.ts";
 import {
   SPINNER_FRAMES,
   buildWorkingTitle,
@@ -70,6 +72,14 @@ interface AppState {
   renderDebounceTimer: ReturnType<typeof setTimeout> | null;
   activeTui: TUI | undefined;
   tokenSpeedEngine: TokenSpeedEngine;
+
+  // TTFT live timer
+  ttftTimer: ReturnType<typeof setInterval> | null;
+
+  // fs.watch git state
+  gitWatcher: fs.FSWatcher | null;
+  gitWatchCwd: string | null;
+  gitPollTimer: ReturnType<typeof setInterval> | null;
 }
 
 function createInitialState(): AppState {
@@ -91,6 +101,10 @@ function createInitialState(): AppState {
     renderDebounceTimer: null,
     activeTui: undefined,
     tokenSpeedEngine: new TokenSpeedEngine(),
+    ttftTimer: null,
+    gitWatcher: null,
+    gitWatchCwd: null,
+    gitPollTimer: null,
   };
 }
 
@@ -225,23 +239,18 @@ function createWidgetFactory(
 ) {
   return (tui: TUI, theme: Theme) => {
     state.activeTui = tui;
-    let cachedWidth: number | undefined;
-    let cachedLines: string[] = [""];
-
-    const renderData: HeaderRenderData = {
-      gitStatus: state.gitStatus,
-      tokenSpeedEngine: state.tokenSpeedEngine,
-    };
 
     return {
       render: (width: number) => {
-        if (cachedWidth === width) return cachedLines;
-        const lines = buildStatusHeader(pi, ctx, renderData, config, theme);
-        cachedLines = lines.map((l) => truncateToWidth(l, width, theme.fg("dim", "...")));
-        cachedWidth = width;
-        return cachedLines;
+        // Don't cache by width — state (gitStatus, tokenSpeed, etc.) changes
+        // asynchronously and must always re-compute on re-render.
+        const lines = buildStatusHeader(pi, ctx, {
+          gitStatus: state.gitStatus,
+          tokenSpeedEngine: state.tokenSpeedEngine,
+        }, config, theme);
+        return lines.map((l) => truncateToWidth(l, width, theme.fg("dim", "...")));
       },
-      invalidate: () => { cachedWidth = undefined; },
+      invalidate: () => {},
       dispose: () => {},
     };
   };
@@ -274,6 +283,98 @@ export default function (pi: ExtensionAPI) {
   const scheduleGitRefresh = (cwd: string) => {
     if (state.gitRefreshTimer) clearTimeout(state.gitRefreshTimer);
     state.gitRefreshTimer = setTimeout(() => void doRefreshGit(cwd), 300);
+  };
+
+  // ── fs.watch git watcher ──
+
+  /** Determine the actual .git directory path (handles worktrees, submodules). */
+  const resolveGitDir = async (cwd: string): Promise<string | null> => {
+    try {
+      const result = await pi.exec("git", ["rev-parse", "--git-dir"], { cwd });
+      const gitDir = result.stdout.trim();
+      if (!gitDir) return null;
+      return path.resolve(cwd, gitDir);
+    } catch {
+      return null;
+    }
+  };
+
+  /** Start watching .git state files for external changes. */
+  const startGitWatcher = async (cwd: string) => {
+    stopGitWatcher();
+
+    const gitDir = await resolveGitDir(cwd);
+    if (!gitDir) return;
+
+    state.gitWatchCwd = cwd;
+
+    const onChange = () => {
+      // Debounce: multiple fs events fire for a single git operation
+      scheduleGitRefresh(cwd);
+    };
+
+    const onError = (err: Error) => {
+      console.error("[status] git fs.watch error:", err.message);
+      // Fall back to polling if fs.watch fails
+      startGitPolling(cwd);
+    };
+
+    try {
+      // Watch .git/ directory (catches HEAD, index, and ref changes)
+      const watcher = fs.watch(gitDir, { recursive: false }, onChange);
+      watcher.on("error", onError);
+
+      // Also watch .git/refs/ recursively for branch/tag creation/deletion
+      let refsWatcher: fs.FSWatcher | null = null;
+      try {
+        if (fs.existsSync(path.join(gitDir, "refs"))) {
+          refsWatcher = fs.watch(path.join(gitDir, "refs"), { recursive: true }, onChange);
+          refsWatcher.on("error", () => {});
+        }
+      } catch { /* refs may not exist in bare repos */ }
+
+      state.gitWatcher = watcher;
+      // Store refsWatcher on the watcher itself for cleanup
+      (watcher as any)._refsWatcher = refsWatcher;
+
+      // Also do a periodic poll as a safety net (WSL/Docker fs.watch is unreliable)
+      startGitPolling(cwd);
+    } catch (err) {
+      console.error("[status] Failed to start git fs.watch, falling back to polling:", (err as Error).message);
+      startGitPolling(cwd);
+    }
+  };
+
+  /** Stop the git fs.watcher and polling timer. */
+  const stopGitWatcher = () => {
+    if (state.gitWatcher) {
+      const refsWatcher = (state.gitWatcher as any)._refsWatcher as fs.FSWatcher | null;
+      if (refsWatcher) refsWatcher.close();
+      state.gitWatcher.close();
+      state.gitWatcher = null;
+    }
+    if (state.gitPollTimer) {
+      clearInterval(state.gitPollTimer);
+      state.gitPollTimer = null;
+    }
+    state.gitWatchCwd = null;
+  };
+
+  /** Fallback periodic polling for platforms where fs.watch is unreliable (WSL, Docker). */
+  const startGitPolling = (cwd: string) => {
+    if (state.gitPollTimer) return;
+    // Poll every 5s as a safety net (tested: git status takes ~10ms)
+    state.gitPollTimer = setInterval(() => {
+      if (state.gitWatchCwd !== cwd) {
+        // cwd changed, stop polling
+        if (state.gitPollTimer) {
+          clearInterval(state.gitPollTimer);
+          state.gitPollTimer = null;
+        }
+        return;
+      }
+      void doRefreshGit(cwd);
+    }, 5_000);
   };
 
   // ── Widget update helpers ──
@@ -312,8 +413,9 @@ export default function (pi: ExtensionAPI) {
     // Start auto theme sync
     await startThemeSync(pi, ctx, state);
 
-    // Initial git refresh
+    // Initial git refresh + start fs.watch on .git state
     void doRefreshGit(ctx.cwd);
+    void startGitWatcher(ctx.cwd);
 
     // Initial widget
     doUpdateWidget(ctx);
@@ -329,6 +431,8 @@ export default function (pi: ExtensionAPI) {
     // Restore built-in footer
     ctx.ui.setFooter(undefined);
 
+    stopGitWatcher();
+    if (state.ttftTimer) { clearInterval(state.ttftTimer); state.ttftTimer = null; }
     if (state.gitRefreshTimer) { clearTimeout(state.gitRefreshTimer); state.gitRefreshTimer = null; }
     if (state.renderDebounceTimer) { clearTimeout(state.renderDebounceTimer); state.renderDebounceTimer = null; }
     state.tokenSpeedEngine.stop();
@@ -406,21 +510,42 @@ export default function (pi: ExtensionAPI) {
   // ── Message lifecycle (token speed tracking + widget updates) ──
 
   pi.on("message_start", async (event) => {
-    if (event.message?.role === "assistant") state.tokenSpeedEngine.start();
+    if (event.message?.role === "assistant") {
+      state.tokenSpeedEngine.start();
+
+      // Start a live TTFT timer that re-renders the status header
+      // while the user waits for the first token to arrive.
+      if (!state.ttftTimer) {
+        state.ttftTimer = setInterval(() => {
+          state.activeTui?.requestRender();
+        }, 500);
+      }
+    }
   });
 
   pi.on("message_update", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
     const ev = (event as any).assistantMessageEvent;
     if (ev?.type === "text_delta" || ev?.type === "thinking_delta") {
-      state.tokenSpeedEngine.recordToken();
+      state.tokenSpeedEngine.recordToken(ev.delta);
+
+      // First token arrived — TTFT is now frozen, stop the live timer
+      if (state.ttftTimer) {
+        clearInterval(state.ttftTimer);
+        state.ttftTimer = null;
+      }
     }
     debouncedUpdate(ctx);
   });
 
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
-    state.tokenSpeedEngine.stop();
+    // Safety: ensure TTFT timer is stopped even if no deltas arrived
+    if (state.ttftTimer) {
+      clearInterval(state.ttftTimer);
+      state.ttftTimer = null;
+    }
+    state.tokenSpeedEngine.finish(event.message.usage?.output ?? 0);
     immediateUpdate(ctx);
   });
 
