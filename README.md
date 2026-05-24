@@ -52,7 +52,7 @@ Patches the `DynamicBorder` component to suppress redundant border lines in bash
 
 ### 📝 request-logger
 
-Logs every provider request to a file (`~/.pi/agent/requests/<session>.request.log`). Captures HTTP status, headers, token counts, model info, and sanitizes sensitive query parameters. Supports configurable max log size via the `PI_REQUEST_LOG_MAX_KB` environment variable.
+Logs every provider request to a file (`~/.pi/agent/requests/<session>.request.log`). Captures HTTP status, headers, token counts, model info, and sanitizes sensitive query parameters.
 
 **File:** `request-logger.ts`
 
@@ -64,46 +64,30 @@ A comprehensive status bar suite with multiple modules:
 
 | Module | Description |
 |--------|-------------|
-| **header.ts** | Rich status header above the editor showing model, working directory + git branch, token statistics, context usage, and generation speed |
+| **header.ts** | Rich status header above the editor showing model, working directory + git branch, token statistics, context usage, generation speed, and TTFT |
 | **title.ts** | Animated terminal title with a braille spinner during agent activity |
 | **theme.ts** | Cross-platform system dark/light mode detection and automatic pi theme switching |
 | **statusline.ts** | `/statusline` command for interactive configuration of which items appear in the header |
 
 **Files:** `status/index.ts`, `status/header.ts`, `status/title.ts`, `status/theme.ts`, `status/statusline.ts`
 
+**TPS** (time window: first token → `message_end`, excluding TTFT):
+- **During streaming** — estimated, via `max(1, round(chars/4))`, the same chars/4 heuristic pi's compaction module uses internally.
+- **After `message_end`** — accurate, `TPS = usage.output / (message_end - first_token_time)`.
+
 ---
 
-### 🔧 tool
+## Pi Internals
 
-Replaces the default bash tool description from _"Execute bash commands (ls, grep, find, etc.)"_ to _"Execute bash commands (ls, rg for text search, fd for file search, etc.)"_, biasing the LLM toward modern search tools.
+You do **not** need any extension to replace `find`/`grep` with `fd`/`rg` — pi already handles this internally. The tool names exposed to the LLM are `find` and `grep` for semantic clarity, but the actual work is done by `fd` and `rg`.
 
-**File:** `tool.ts`
+example:
 
-- `~/.pi/agent/AGENTS.md`
-
-This extension works best when paired with `~/.pi/agent/AGENTS.md`, which enforces the same search policy at the instruction level. Place it at:
-
-- `~/.pi/agent/AGENTS.md` — global (all projects)
-- `<project>/.pi/agent/AGENTS.md` — project-local
-
-```markdown
-# Bash Search Command Policy
-
-These rules override any generic examples that mention `find`, `grep`, or recursive shell search.
-
-Use bash for shell commands. For project search:
-- use `rg` for text search
-- use `fd` for file/path search
-- use `sg` for AST/code-structure search
-
-## Forbidden by default
-
-Do NOT use these commands for project search:
-- `find .`
-- `find <path>`
-- `grep -R`
-- `egrep -R`
-- `ls -R`
-
-Do not use `find` or `grep` unless other tools are unavailable.
+```
+LLM calls "find" tool
+  → pi receives the "find" tool call
+    → find.ts execute()
+      → ensureTool("fd", true)   ← auto-downloads fd if missing
+        → spawn(fd binary, fd args)
+          → returns fd search results
 ```
