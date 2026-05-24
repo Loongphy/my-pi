@@ -81,6 +81,8 @@ A comprehensive status bar suite with multiple modules:
 
 ## 429 Rate-Limit Workaround (OpenCode)
 
+![429 limit](https://github.com/user-attachments/assets/907d920d-5d20-4193-b298-416179fc0c69)
+
 > **Temporary workaround** for SDK 429 retry hang, integrated into `request-logger.ts`.
 >
 > **Related issues:**
