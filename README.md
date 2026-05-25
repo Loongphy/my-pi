@@ -60,6 +60,14 @@ Logs every provider request to a file (`~/.pi/agent/requests/<session>.request.l
 
 ---
 
+### ⌨️ shortcuts
+
+Adds `Ctrl+Shift+C` to copy the current editor content to the system clipboard.
+
+**File:** `shortcuts.ts`
+
+---
+
 ### 📊 status
 
 A comprehensive status bar suite with multiple modules:
