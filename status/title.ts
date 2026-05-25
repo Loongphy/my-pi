@@ -39,14 +39,14 @@ function getTitleParts(pi: ExtensionAPI) {
 
 export function buildWorkingTitle(pi: ExtensionAPI, frame: string): string {
   const { cwd, session } = getTitleParts(pi);
-  const parts = [cwd, `${frame} \u03C0`];
+  const parts = [`${frame} \u03C0`, cwd];
   if (session) parts.push(session);
   return parts.join(" \u00B7 ");
 }
 
 export function buildIdleTitle(pi: ExtensionAPI): string {
   const { cwd, session } = getTitleParts(pi);
-  const parts = [cwd, "\u03C0"];
+  const parts = ["\u03C0", cwd];
   if (session) parts.push(session);
   return parts.join(" \u00B7 ");
 }

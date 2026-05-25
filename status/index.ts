@@ -27,13 +27,17 @@ import type { TUI } from "@earendil-works/pi-tui";
 
 import { startThemeSync, stopThemeSync } from "./theme.ts";
 import {
-  collectGitStatus,
   loadStatusConfig,
   buildStatusHeader,
-  TokenSpeedEngine,
 } from "./header.ts";
 import { registerStatuslineCommand } from "./statusline.ts";
-import type { GitStatus, StatusLineConfig } from "./header.ts";
+import {
+  collectGitStatus,
+  resolveGitDir,
+  type GitStatus,
+} from "./git.ts";
+import { TokenSpeedEngine } from "./tps.ts";
+import type { StatusLineConfig } from "./header.ts";
 import {
   SPINNER_FRAMES,
   buildWorkingTitle,
@@ -287,23 +291,11 @@ export default function (pi: ExtensionAPI) {
 
   // ── fs.watch git watcher ──
 
-  /** Determine the actual .git directory path (handles worktrees, submodules). */
-  const resolveGitDir = async (cwd: string): Promise<string | null> => {
-    try {
-      const result = await pi.exec("git", ["rev-parse", "--git-dir"], { cwd });
-      const gitDir = result.stdout.trim();
-      if (!gitDir) return null;
-      return path.resolve(cwd, gitDir);
-    } catch {
-      return null;
-    }
-  };
-
   /** Start watching .git state files for external changes. */
   const startGitWatcher = async (cwd: string) => {
     stopGitWatcher();
 
-    const gitDir = await resolveGitDir(cwd);
+    const gitDir = await resolveGitDir(cwd, pi.exec.bind(pi));
     if (!gitDir) return;
 
     state.gitWatchCwd = cwd;
@@ -406,6 +398,9 @@ export default function (pi: ExtensionAPI) {
 
     state.isAutoTitling = false;
 
+    // 清除上一次会话残留的耗时显示
+    ctx.ui.setWidget("agent-total-time", undefined);
+
     // Set working indicator (rainbow spinner)
     ctx.ui.setWorkingIndicator(buildWorkingIndicator());
     ctx.ui.setTitle(buildIdleTitle(pi));
@@ -444,6 +439,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", async (_event, ctx) => {
     state.isWorking = true;
     state.isThinking = true;
+    // 清除上一次的耗时显示
+    ctx.ui.setWidget("agent-total-time", undefined);
     startTitleAnimation(pi, ctx, state);
     startWorkingMessage(ctx, state);
   });
@@ -454,15 +451,27 @@ export default function (pi: ExtensionAPI) {
     stopTitleAnimation(ctx, state);
     ctx.ui.setTitle(buildIdleTitle(pi));
 
+    // 停止计时器，记录总耗时（从 agent_start 到 agent_end）
     if (state.workingMessageTimer) {
       clearInterval(state.workingMessageTimer);
       state.workingMessageTimer = null;
     }
+    const elapsedMs =
+      state.agentStartMs !== null ? Date.now() - state.agentStartMs : null;
     state.agentStartMs = null;
+    state.lastTurnDurationMs = null;
 
-    if (state.lastTurnDurationMs !== null) {
-      showTurnDuration(ctx, state.lastTurnDurationMs);
-      state.lastTurnDurationMs = null;
+    if (elapsedMs !== null) {
+      // 用 widget 显示最终耗时（status 正下方，不会被核心代码清除）
+      const theme = ctx.ui.theme;
+      const total = Math.round(elapsedMs / 1000);
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      const timeStr = [h > 0 && `${h}h`, m > 0 && `${m}m`, `${s}s`].filter(Boolean).join(" ");
+      ctx.ui.setWidget("agent-total-time", [
+        `${theme.fg("success", "✓")} ${theme.fg("dim", "Worked for")} ${theme.bold(timeStr)}`,
+      ]);
     } else {
       ctx.ui.setWorkingMessage();
       ctx.ui.setWorkingVisible(false);
