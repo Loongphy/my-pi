@@ -15,7 +15,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { complete } from "@earendil-works/pi-ai";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -72,6 +72,7 @@ interface AppState {
 
   // Status header
   gitStatus: GitStatus | null;
+  lastAgentDuration: string | null;
   gitRefreshTimer: ReturnType<typeof setTimeout> | null;
   renderDebounceTimer: ReturnType<typeof setTimeout> | null;
   activeTui: TUI | undefined;
@@ -101,6 +102,7 @@ function createInitialState(): AppState {
     themeTimer: null,
     currentAutoTheme: null,
     gitStatus: null,
+    lastAgentDuration: null,
     gitRefreshTimer: null,
     renderDebounceTimer: null,
     activeTui: undefined,
@@ -248,11 +250,23 @@ function createWidgetFactory(
       render: (width: number) => {
         // Don't cache by width — state (gitStatus, tokenSpeed, etc.) changes
         // asynchronously and must always re-compute on re-render.
-        const lines = buildStatusHeader(pi, ctx, {
+        const lines: string[] = [];
+        if (state.lastAgentDuration) {
+          const text = `Worked for ${state.lastAgentDuration}`;
+          const plainLeft = `─ ${text} ─`;
+          const fillerCount = width - 2 - visibleWidth(plainLeft);
+          const filler = fillerCount > 0 ? theme.fg("dim", "─".repeat(fillerCount)) : "";
+          lines.push(` ${theme.fg("dim", "─")} ${theme.fg("dim", text)} ${theme.fg("dim", "─")}${filler} `);
+          lines.push(""); // bottom margin
+        }
+        const statusLines = buildStatusHeader(pi, ctx, {
           gitStatus: state.gitStatus,
           tokenSpeedEngine: state.tokenSpeedEngine,
         }, config, theme);
-        return lines.map((l) => truncateToWidth(l, width, theme.fg("dim", "...")));
+        for (const l of statusLines) {
+          lines.push(truncateToWidth(l, width, theme.fg("dim", "...")));
+        }
+        return lines;
       },
       invalidate: () => {},
       dispose: () => {},
@@ -398,8 +412,7 @@ export default function (pi: ExtensionAPI) {
 
     state.isAutoTitling = false;
 
-    // 清除上一次会话残留的耗时显示
-    ctx.ui.setWidget("agent-total-time", undefined);
+    state.lastAgentDuration = null;
 
     // Set working indicator (rainbow spinner)
     ctx.ui.setWorkingIndicator(buildWorkingIndicator());
@@ -439,8 +452,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", async (_event, ctx) => {
     state.isWorking = true;
     state.isThinking = true;
-    // 清除上一次的耗时显示
-    ctx.ui.setWidget("agent-total-time", undefined);
+    state.lastAgentDuration = null;
     startTitleAnimation(pi, ctx, state);
     startWorkingMessage(ctx, state);
   });
@@ -462,21 +474,15 @@ export default function (pi: ExtensionAPI) {
     state.lastTurnDurationMs = null;
 
     if (elapsedMs !== null) {
-      // 用 widget 显示最终耗时（status 正下方，不会被核心代码清除）
-      const theme = ctx.ui.theme;
       const total = Math.round(elapsedMs / 1000);
       const h = Math.floor(total / 3600);
       const m = Math.floor((total % 3600) / 60);
       const s = total % 60;
-      const timeStr = [h > 0 && `${h}h`, m > 0 && `${m}m`, `${s}s`].filter(Boolean).join(" ");
-      ctx.ui.setWidget("agent-total-time", [
-        `${theme.fg("success", "✓")} ${theme.fg("dim", "Worked for")} ${theme.bold(timeStr)}`,
-      ]);
+      state.lastAgentDuration = [h > 0 && `${h}h`, m > 0 && `${m}m`, `${s}s`].filter(Boolean).join(" ");
     } else {
       ctx.ui.setWorkingMessage();
       ctx.ui.setWorkingVisible(false);
     }
-
     immediateUpdate(ctx);
     autoGenerateTitle(pi, ctx, state);
     scheduleGitRefresh(ctx.cwd);
