@@ -37,23 +37,43 @@ export function isWSL(): boolean {
 
 // ── System theme detection ──
 
+// WSL: cached result to avoid repeated PowerShell cold starts
+let wslDarkModeCache: { value: boolean; timestamp: number } | null = null;
+const WSL_CACHE_TTL_MS = 10_000; // cache for 10s to avoid cold start penalty
+
 export async function isDarkMode(): Promise<boolean> {
   try {
     if (isWSL()) {
-      // Try PowerShell first (Windows 10+), fall back to reg.exe
+      // Return cached value if still fresh
+      if (wslDarkModeCache && Date.now() - wslDarkModeCache.timestamp < WSL_CACHE_TTL_MS) {
+        return wslDarkModeCache.value;
+      }
+
+      // Try reg.exe first (fast, ~0.3s) — no .NET cold start penalty
+      try {
+        const { stdout } = await execAsync(
+          `reg.exe query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize" /v AppsUseLightTheme 2>/dev/null`,
+        );
+        const isDark = stdout.includes("0x0");
+        wslDarkModeCache = { value: isDark, timestamp: Date.now() };
+        return isDark;
+      } catch { /* fall through to PowerShell */ }
+
+      // Fallback: PowerShell (slower, but works for some edge cases)
       try {
         const { stdout } = await execAsync(
           `powershell.exe -NoProfile -Command "(Get-ItemPropertyValue -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize' -Name AppsUseLightTheme)" 2>/dev/null`,
         );
         const trimmed = stdout.trim();
-        if (trimmed === "0") return true;
-        if (trimmed === "1") return false;
+        if (trimmed === "0" || trimmed === "1") {
+          const isDark = trimmed === "0";
+          wslDarkModeCache = { value: isDark, timestamp: Date.now() };
+          return isDark;
+        }
       } catch { /* fall through */ }
 
-      const { stdout } = await execAsync(
-        `reg.exe query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize" /v AppsUseLightTheme 2>/dev/null`,
-      );
-      return stdout.includes("0x0");
+      // Return cached value even if expired, or default to light
+      return wslDarkModeCache?.value ?? false;
     }
 
     const os = platform();

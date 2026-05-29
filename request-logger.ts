@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
-import type { ExtensionAPI, ModelSelectEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ModelSelectEvent } from "@earendil-works/pi-coding-agent";
 
 // ============================================================
 // Configuration
@@ -152,6 +152,28 @@ function rollLog(): void {
 // ============================================================
 const pendingPayloads: { model: string }[] = [];
 
+// ============================================================
+// TUI notification for non-2xx provider errors
+// ============================================================
+let _tuiCtx: ExtensionContext | null = null;
+let _lastErrorBody = "";
+
+function formatErrorForTui(status: number, body: string, maxLen = 200): string {
+  if (!body) return `HTTP ${status}`;
+  try {
+    const parsed = JSON.parse(body);
+    const msg = parsed.error?.message || parsed.error || parsed.message || "";
+    if (msg && typeof msg === "string") {
+      const cleaned = sanitizeError(msg);
+      if (cleaned.length <= maxLen) return `HTTP ${status}: ${cleaned}`;
+      return `HTTP ${status}: ${cleaned.slice(0, maxLen)}…`;
+    }
+  } catch { /* not JSON */ }
+  const cleaned = sanitizeError(body.trim());
+  if (cleaned.length <= maxLen) return `HTTP ${status}: ${cleaned}`;
+  return `HTTP ${status}: ${cleaned.slice(0, maxLen)}…`;
+}
+
 const recentLogs = new Set<string>();
 function markLogged(key: string): boolean {
   if (recentLogs.has(key)) return false;
@@ -279,6 +301,7 @@ if (typeof _underlyingFetch === "function") {
               `[${ts}] RESPONSE 429 (rewritten to 400 by rate-limit workaround)` +
               `\n│ header:\n${rhLines}\n└─`
             );
+            _tuiCtx?.ui.notify(`🚫 Provider rate-limited (HTTP 429)`, "error");
           }
 
           // 429 workaround for opencode.ai: rewrite to 400 with reset time
@@ -330,6 +353,9 @@ if (typeof _underlyingFetch === "function") {
                 }
 
                 bodySection = `\n│ body:\n` + display.split("\n").map(l => `    ${l}`).join("\n");
+
+                // Cache body for after_provider_response TUI notification
+                _lastErrorBody = bodyText;
               } catch (bodyErr) {
                 bodySection = `\n│ body: (failed to read: ${bodyErr instanceof Error ? bodyErr.message : String(bodyErr)})`;
               }
@@ -348,6 +374,7 @@ if (typeof _underlyingFetch === "function") {
           if (isProviderReq && !isDuplicate) {
             const errMsg = err instanceof Error ? err.message : String(err);
             appendLog(`[${ts}] FETCH ERROR: ${sanitizeError(errMsg)}`);
+            _tuiCtx?.ui.notify(`🌐 Network error: ${sanitizeError(errMsg)}`, "error");
           }
           throw err;
         }
@@ -370,8 +397,10 @@ export default function (pi: ExtensionAPI): void {
     if (!existsSync(REQUESTS_DIR)) mkdirSync(REQUESTS_DIR, { recursive: true });
   } catch { /* ignore */ }
 
-  // Push minimal model info so the fetch interceptor knows this is a provider request.
-  pi.on("before_provider_request", (event: { type: string; payload: unknown }) => {
+  // Track ctx for TUI notifications
+  pi.on("before_provider_request", (event, ctx) => {
+    _tuiCtx = ctx;
+
     let model = "";
     try {
       const body = event.payload as Record<string, unknown>;
@@ -380,8 +409,23 @@ export default function (pi: ExtensionAPI): void {
     pendingPayloads.push({ model: model || "?" });
   });
 
+  // after_provider_response: show TUI notification for non-2xx provider HTTP responses
+  // Fires after HTTP response received, before stream consumed — body already cached by fetch interceptor
+  pi.on("after_provider_response", (event, ctx) => {
+    _tuiCtx = ctx;
+
+    if (event.status < 200 || event.status >= 300) {
+      const body = _lastErrorBody;
+      _lastErrorBody = "";
+      ctx.ui.notify(formatErrorForTui(event.status, body), "error");
+    } else {
+      _lastErrorBody = "";
+    }
+  });
+
   // Log session start — create per-session file
-  pi.on("session_start", () => {
+  pi.on("session_start", (_event, ctx) => {
+    _tuiCtx = ctx;
     const sessionId = process.env.OPENCODE_SESSION_ID || "unknown";
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
     const sessionDir = join(REQUESTS_DIR, SESSION_DIR_NAME);
@@ -393,7 +437,8 @@ export default function (pi: ExtensionAPI): void {
   });
 
   // Log model switches
-  pi.on("model_select", (event: ModelSelectEvent) => {
+  pi.on("model_select", (event: ModelSelectEvent, ctx) => {
+    _tuiCtx = ctx;
     const modelStr = `${event.model.provider}/${event.model.id}`;
     appendLog(`[${new Date().toISOString()}] MODEL ${modelStr} (${event.source})`);
   });

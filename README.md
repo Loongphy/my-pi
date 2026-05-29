@@ -34,17 +34,21 @@ Then reload pi:
 
 ## Extensions
 
-### 📦 collapse-tools
+### 📦 compact-tool
 
-Collapses verbose tool outputs (bash, read, write, edit) into compact one-liners showing only the tool name and key parameters. Press `Ctrl+O` to expand/collapse and view full output. Fully adapts to the system theme.
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/0c8fbd7d-36f0-418a-923a-5a68e409ab6a" height="400">
+</p>
 
-**File:** `collapse-tools.ts`
+Inspired by Codex style.
 
-**Credits:** [xRyul/pi-collapse-tools](https://github.com/xRyul/pi-collapse-tools)
+**File:** `compact-tool.ts`
 
 ---
 
 ### ✏️ editor
+
+![editor](https://github.com/user-attachments/assets/890dc61a-e42e-42ea-860d-ea0809f2ab12)
 
 Patches the `DynamicBorder` component to suppress redundant border lines in bash mode, keeping the editor area clean and clutter-free.
 
@@ -74,12 +78,15 @@ A comprehensive status bar suite with multiple modules:
 
 | Module | Description |
 |--------|-------------|
+| **index.ts** | Main extension entry point, orchestrates all status modules |
 | **header.ts** | Rich status header above the editor showing model, working directory + git branch, token statistics, context usage, generation speed, and TTFT |
+| **git.ts** | Git status detection — branch name, ahead/behind counts, staged/modified/deleted/conflicted/untracked file counts |
+| **tps.ts** | Token speed engine — real-time TPS estimation during streaming, accurate TPS after completion, TTFT measurement |
 | **title.ts** | Animated terminal title with a braille spinner during agent activity |
 | **theme.ts** | Cross-platform system dark/light mode detection and automatic pi theme switching |
 | **statusline.ts** | `/statusline` command for interactive configuration of which items appear in the header |
 
-**Files:** `status/index.ts`, `status/header.ts`, `status/title.ts`, `status/theme.ts`, `status/statusline.ts`
+**Files:** `status/index.ts`, `status/header.ts`, `status/git.ts`, `status/tps.ts`, `status/title.ts`, `status/theme.ts`, `status/statusline.ts`
 
 **TPS** (time window: first token → `message_end`, excluding TTFT):
 - **During streaming** — estimated, via `max(1, round(chars/4))`, the same chars/4 heuristic pi's compaction module uses internally.
@@ -109,20 +116,3 @@ A comprehensive status bar suite with multiple modules:
 > retry loop.
 >
 > **Remove this workaround once the upstream issue is fixed.**
-
----
-
-## Pi Internals
-
-You do **not** need any extension to replace `find`/`grep` with `fd`/`rg` — pi already handles this internally. The tool names exposed to the LLM are `find` and `grep` for semantic clarity, but the actual work is done by `fd` and `rg`.
-
-example:
-
-```
-LLM calls "find" tool
-  → pi receives the "find" tool call
-    → find.ts execute()
-      → ensureTool("fd", true)   ← auto-downloads fd if missing
-        → spawn(fd binary, fd args)
-          → returns fd search results
-```
