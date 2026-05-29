@@ -524,6 +524,10 @@ export default function (pi: ExtensionAPI) {
 
   // ── Message lifecycle (token speed tracking + widget updates) ──
 
+  pi.on("before_provider_request", async () => {
+    state.tokenSpeedEngine.recordHttpRequest();
+  });
+
   pi.on("message_start", async (event) => {
     if (event.message?.role === "assistant") {
       state.tokenSpeedEngine.start();

@@ -92,6 +92,8 @@ A comprehensive status bar suite with multiple modules:
 - **During streaming** — estimated, via `max(1, round(chars/4))`, the same chars/4 heuristic pi's compaction module uses internally.
 - **After `message_end`** — accurate, `TPS = usage.output / (message_end - first_token_time)`.
 
+**TTFT** (time to first token): `TTFT = first_token_time - http_request_sent_time`
+
 ---
 
 ## 429 Rate-Limit Workaround (OpenCode)

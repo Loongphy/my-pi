@@ -80,7 +80,6 @@ export interface TokenStats {
   totalOutput: number;
   totalCacheRead: number;
   totalCacheWrite: number;
-  totalCost: number;
 }
 
 /**
@@ -92,7 +91,6 @@ export function computeTokenStats(ctx: ExtensionContext): TokenStats {
   let totalOutput = 0;
   let totalCacheRead = 0;
   let totalCacheWrite = 0;
-  let totalCost = 0;
   try {
     for (const entry of ctx.sessionManager.getEntries()) {
       if (entry.type === "message" && entry.message?.role === "assistant" && entry.message.usage) {
@@ -100,11 +98,10 @@ export function computeTokenStats(ctx: ExtensionContext): TokenStats {
         totalOutput += entry.message.usage.output || 0;
         totalCacheRead += entry.message.usage.cacheRead || 0;
         totalCacheWrite += entry.message.usage.cacheWrite || 0;
-        totalCost += entry.message.usage.cost?.total || 0;
       }
     }
   } catch { /* session not ready */ }
-  return { totalInput, totalOutput, totalCacheRead, totalCacheWrite, totalCost };
+  return { totalInput, totalOutput, totalCacheRead, totalCacheWrite };
 }
 
 // ── Status header rendering ──
@@ -165,7 +162,7 @@ export function buildStatusHeader(
     parts.push(theme.fg("text", branchStr));
   }
 
-  // 4. Token stats: ↑ tokens ↓ tokens $cost
+  // 4. Token stats: ↑ tokens ↓ tokens
   if (config.tokenStats) {
     const stats = computeTokenStats(ctx);
     const statStrs: string[] = [];
@@ -173,7 +170,6 @@ export function buildStatusHeader(
     if (stats.totalOutput) statStrs.push(`\u2193${formatTokens(stats.totalOutput)}`);
     if (stats.totalCacheRead) statStrs.push(`R${formatTokens(stats.totalCacheRead)}`);
     if (stats.totalCacheWrite) statStrs.push(`W${formatTokens(stats.totalCacheWrite)}`);
-    if (stats.totalCost) statStrs.push(`\u0024${stats.totalCost.toFixed(3)}`);
     if (statStrs.length > 0) {
       parts.push(theme.fg("muted", statStrs.join(" ")));
     }
@@ -184,8 +180,11 @@ export function buildStatusHeader(
     const usage = ctx.getContextUsage();
     const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
     const contextPct = usage?.percent;
+    const contextTokens = usage?.tokens;
     let ctxStr: string;
-    if (contextPct !== null && contextPct !== undefined) {
+    if (contextPct !== null && contextPct !== undefined && contextTokens !== null && contextTokens !== undefined) {
+      ctxStr = `${contextPct.toFixed(0)}% ${formatTokens(contextTokens)}/${formatTokens(contextWindow)}`;
+    } else if (contextPct !== null && contextPct !== undefined) {
       ctxStr = `${contextPct.toFixed(0)}%/${formatTokens(contextWindow)}`;
     } else {
       ctxStr = `?/${formatTokens(contextWindow)}`;

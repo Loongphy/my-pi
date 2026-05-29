@@ -3,7 +3,7 @@
  *
  * Tracks two metrics during assistant streaming:
  *   1. TPS (tokens per second) — real-time via char/4 heuristic, final via usage.output
- *   2. TTFT (time to first token) — wall-clock from message_start to first text/thinking delta
+ *   2. TTFT (time to first token) — wall-clock from HTTP request to first text/thinking delta
  *
  * TTFT is always a real time measurement (no estimation), so it is the same
  * whether read during streaming or from the finalised message_end.
@@ -24,6 +24,7 @@ export class TokenSpeedEngine {
 
   // Timing — excludes TTFT for TPS calculation
   private _messageStartTime = 0;
+  private _httpRequestStartTime = 0;
   private _generationStartTime = 0;
   private _generationEndTime = 0;
   private _firstTokenArrived = false;
@@ -54,7 +55,7 @@ export class TokenSpeedEngine {
   /**
    * TTFT in seconds.
    *
-   * Before first token arrives: returns a live (Date.now() - messageStart) value
+   * Before first token arrives: returns a live (Date.now() - httpRequestStart) value
    * so the status header shows a counting-up timer while the user waits.
    *
    * After first token: returns the frozen measured TTFT.
@@ -62,9 +63,9 @@ export class TokenSpeedEngine {
   get ttftSec(): number {
     // First token has arrived — show the frozen measured value
     if (this._firstTokenArrived) return this._ttftMs / 1000;
-    // Waiting for first token — live count-up from message_start
-    if (this._isStreaming && this._messageStartTime > 0) {
-      return (Date.now() - this._messageStartTime) / 1000;
+    // Waiting for first token — live count-up from http request start
+    if (this._isStreaming && this._httpRequestStartTime > 0) {
+      return (Date.now() - this._httpRequestStartTime) / 1000;
     }
     return this._ttftMs / 1000;
   }
@@ -110,6 +111,14 @@ export class TokenSpeedEngine {
   }
 
   /**
+   * Call on before_provider_request.
+   * Records the time when HTTP request is about to be sent.
+   */
+  recordHttpRequest() {
+    this._httpRequestStartTime = Date.now();
+  }
+
+  /**
    * Call on message_start (assistant).
    * Records message-start wall time for TTFT calculation.
    */
@@ -119,7 +128,10 @@ export class TokenSpeedEngine {
     this._charCount = 0;
     this._approxTokenCount = 0;
     this._realOutputTokens = 0;
-    this._messageStartTime = Date.now();
+    // Use HTTP request time as TTFT start point if available
+    this._messageStartTime = this._httpRequestStartTime > 0
+      ? this._httpRequestStartTime
+      : Date.now();
     this._generationStartTime = 0;
     this._firstTokenArrived = false;
     this._ttftMs = 0;
@@ -183,6 +195,7 @@ export class TokenSpeedEngine {
   stop() {
     this._isStreaming = false;
     this._finished = false;
+    this._httpRequestStartTime = 0;
     this._generationEndTime = 0;
     this._tokenTimestamps = [];
     this._windowStartIndex = 0;
