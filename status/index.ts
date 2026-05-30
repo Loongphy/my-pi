@@ -419,7 +419,13 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setTitle(buildIdleTitle(pi));
 
     // Start auto theme sync
-    await startThemeSync(pi, ctx, state, () => state.activeTui?.requestRender());
+    await startThemeSync(pi, ctx, state, () => {
+      // Re-create the widget (same as debouncedUpdate/immediateUpdate) so the
+      // status header picks up the new theme immediately, and force a full TUI
+      // redraw so ALL components refresh with the new theme colors.
+      doUpdateWidget(ctx);
+      state.activeTui?.requestRender(true);
+    });
 
     // Initial git refresh + start fs.watch on .git state
     void doRefreshGit(ctx.cwd);
