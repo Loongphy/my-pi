@@ -419,7 +419,7 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setTitle(buildIdleTitle(pi));
 
     // Start auto theme sync
-    await startThemeSync(pi, ctx, state);
+    await startThemeSync(pi, ctx, state, () => state.activeTui?.requestRender());
 
     // Initial git refresh + start fs.watch on .git state
     void doRefreshGit(ctx.cwd);

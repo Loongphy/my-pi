@@ -111,6 +111,7 @@ export async function startThemeSync(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   state: ThemeSyncState,
+  requestRender?: () => void,
 ): Promise<void> {
   // Clear any existing timer and stop previous sync
   stopThemeSync(state);
@@ -121,6 +122,7 @@ export async function startThemeSync(
   const target = await resolveTargetTheme();
   state.currentAutoTheme = target;
   ctx.ui.setTheme(target);
+  requestRender?.();
 
   state.themeTimer = setInterval(async () => {
     // Use the stored ctx (updated on each session_start)
@@ -129,6 +131,7 @@ export async function startThemeSync(
     if (target !== state.currentAutoTheme) {
       state.currentAutoTheme = target;
       state.activeCtx.ui.setTheme(target);
+      requestRender?.();
     }
   }, THEME_POLL_INTERVAL_MS);
 }
