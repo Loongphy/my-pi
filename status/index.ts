@@ -6,7 +6,6 @@
  *   - Real-time "Working for" message
  *   - Turn duration display
  *   - Auto conversation title generation
- *   - Auto theme sync (theme.ts)
  *   - Status header widget replacing footer (header.ts)
  *
  * Hides the built-in footer to avoid duplication.
@@ -25,7 +24,6 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 
-import { startThemeSync, stopThemeSync } from "./theme.ts";
 import {
   loadStatusConfig,
   buildStatusHeader,
@@ -57,6 +55,7 @@ interface AppState {
 
   // Agent lifecycle
   isWorking: boolean;
+  isRetrying: boolean;
   isThinking: boolean;
   turnStartMs: number | null;
   lastTurnDurationMs: number | null;
@@ -65,10 +64,6 @@ interface AppState {
 
   // Auto-title
   isAutoTitling: boolean;
-
-  // Theme
-  themeTimer: ReturnType<typeof setInterval> | null;
-  currentAutoTheme: string | null;
 
   // Status header
   gitStatus: GitStatus | null;
@@ -93,14 +88,13 @@ function createInitialState(): AppState {
     frameIndex: 0,
     activeCtx: null,
     isWorking: false,
+    isRetrying: false,
     isThinking: false,
     turnStartMs: null,
     lastTurnDurationMs: null,
     workingMessageTimer: null,
     agentStartMs: null,
     isAutoTitling: false,
-    themeTimer: null,
-    currentAutoTheme: null,
     gitStatus: null,
     lastAgentDuration: null,
     gitRefreshTimer: null,
@@ -402,6 +396,22 @@ export default function (pi: ExtensionAPI) {
     state.activeTui?.requestRender();
   };
 
+  // ── Retry lifecycle — keep timer running across retries ──
+  pi.on("auto_retry_start", async (_event) => {
+    state.isRetrying = true;
+  });
+
+  pi.on("auto_retry_end", async (_event, ctx) => {
+    state.isRetrying = false;
+    // On successful retry, the working loader may have been cleared by
+    // interactive-mode's statusContainer.clear(). Restore it so the
+    // "Working for XXs" display continues smoothly.
+    if (_event.success && state.agentStartMs !== null) {
+      ctx.ui.setWorkingMessage(formatDuration(Date.now() - state.agentStartMs, "Working for"));
+      ctx.ui.setWorkingVisible(true);
+    }
+  });
+
   // ── Session lifecycle ──
 
   pi.on("session_start", async (_event, ctx) => {
@@ -418,15 +428,6 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setWorkingIndicator(buildWorkingIndicator());
     ctx.ui.setTitle(buildIdleTitle(pi));
 
-    // Start auto theme sync
-    await startThemeSync(pi, ctx, state, () => {
-      // Re-create the widget (same as debouncedUpdate/immediateUpdate) so the
-      // status header picks up the new theme immediately, and force a full TUI
-      // redraw so ALL components refresh with the new theme colors.
-      doUpdateWidget(ctx);
-      state.activeTui?.requestRender(true);
-    });
-
     // Initial git refresh + start fs.watch on .git state
     void doRefreshGit(ctx.cwd);
     void startGitWatcher(ctx.cwd);
@@ -438,7 +439,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     stopTitleAnimation(ctx, state);
     stopWorkingMessage(ctx, state);
-    stopThemeSync(state);
     ctx.ui.setWorkingMessage();
     ctx.ui.setWorkingVisible(false);
     ctx.ui.setWorkingIndicator();
@@ -456,11 +456,15 @@ export default function (pi: ExtensionAPI) {
   // ── Agent lifecycle ──
 
   pi.on("agent_start", async (_event, ctx) => {
+    const wasAlreadyWorking = state.isWorking;
     state.isWorking = true;
     state.isThinking = true;
     state.lastAgentDuration = null;
     startTitleAnimation(pi, ctx, state);
-    startWorkingMessage(ctx, state);
+    // Only reset the timer on fresh starts, not on retry recovery
+    if (!wasAlreadyWorking && !state.isRetrying) {
+      startWorkingMessage(ctx, state);
+    }
   });
 
   pi.on("agent_end", async (_event, ctx) => {

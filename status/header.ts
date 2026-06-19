@@ -5,6 +5,7 @@
  * - Model
  * - Current working directory + git branch
  * - Token statistics (input/output/cache, matching pi's built-in footer)
+ * - Cache hit rate (cumulative / last request)
  * - Context usage (percentage / window)
  * - Token generation speed
  *
@@ -35,6 +36,7 @@ export interface StatusLineConfig {
   currentDir: boolean;
   gitBranch: boolean;
   tokenStats: boolean;
+  cacheRate: boolean;
   contextUsage: boolean;
   tokenSpeed: boolean;
   ttft: boolean;
@@ -46,6 +48,7 @@ export const DEFAULT_STATUS_CONFIG: StatusLineConfig = {
   currentDir: true,
   gitBranch: true,
   tokenStats: true,
+  cacheRate: true,
   contextUsage: true,
   tokenSpeed: true,
   ttft: true,
@@ -102,6 +105,28 @@ export function computeTokenStats(ctx: ExtensionContext): TokenStats {
     }
   } catch { /* session not ready */ }
   return { totalInput, totalOutput, totalCacheRead, totalCacheWrite };
+}
+
+/**
+ * Compute the cache hit rate for the last assistant request.
+ * Returns null when there is no usage data or the denominator is zero.
+ */
+export function computeLastCacheRate(ctx: ExtensionContext): number | null {
+  try {
+    const entries = ctx.sessionManager.getEntries();
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i];
+      if (entry.type === "message" && entry.message?.role === "assistant" && entry.message.usage) {
+        const u = entry.message.usage;
+        const cr = u.cacheRead || 0;
+        const inp = u.input || 0;
+        const denom = cr + inp;
+        if (denom === 0) return null;
+        return cr / denom;
+      }
+    }
+  } catch { /* session not ready */ }
+  return null;
 }
 
 // ── Status header rendering ──
@@ -175,6 +200,23 @@ export function buildStatusHeader(
     }
   }
 
+  // 4b. Cache hit rate: cumulative / last request
+  // Only show when usage data is available (e.g. after at least one assistant response).
+  // On /reload or resume, session data loaded from disk provides the same source.
+  if (config.cacheRate) {
+    const stats = computeTokenStats(ctx);
+    const hasUsageData = stats.totalInput > 0 || stats.totalCacheRead > 0;
+    if (hasUsageData) {
+      const cumDenom = stats.totalCacheRead + stats.totalInput;
+      const cumRate = cumDenom > 0 ? stats.totalCacheRead / cumDenom : 0;
+      const lastRate = computeLastCacheRate(ctx);
+      const cumPct = (cumRate * 100).toFixed(1);
+      const lastPct = lastRate !== null ? (lastRate * 100).toFixed(1) : "—";
+      const cacheStr = `Cache ${cumPct}%/last ${lastPct}%`;
+      parts.push(theme.fg("muted", cacheStr));
+    }
+  }
+
   // 5. Context usage: 54%/128K or colored at high thresholds
   if (config.contextUsage) {
     const usage = ctx.getContextUsage();
@@ -227,6 +269,7 @@ export const STATUSLINE_ITEMS: Array<{
   { id: "currentDir", label: "current-dir", description: "Current working directory with git branch" },
   { id: "gitBranch", label: "git-branch", description: "Git branch in path label" },
   { id: "tokenStats", label: "token-stats", description: "Input/output/cache token counts" },
+  { id: "cacheRate", label: "cache-rate", description: "Cache hit rate (cumulative / last request)" },
   { id: "contextUsage", label: "context-usage", description: "Context window usage percentage" },
   { id: "tokenSpeed", label: "token-speed", description: "Token generation speed" },
   { id: "ttft", label: "ttft", description: "Time to first token" },

@@ -162,50 +162,30 @@ export default function (pi: ExtensionAPI) {
       const maxWaitMs = 10 * 60 * 1000; // 10 分钟
       actualWaitMs = Math.min(actualWaitMs, maxWaitMs);
 
-      // 更新状态显示
-      const waitSec = Math.ceil(actualWaitMs / 1000);
+      // 倒计时显示（原地更新同一行，不累积）
       const theme = _ctx?.ui?.theme;
-      if (theme) {
-        _ctx?.ui?.setStatus?.(
-          "429-retry",
-          theme.fg("warning", `⏳ Rate limited! Waiting ${formatTime(waitSec)}... (attempt ${attempts}/${MAX_RETRIES})`)
-        );
+      const endTime = Date.now() + actualWaitMs;
+      while (Date.now() < endTime) {
+        const remainingSec = Math.ceil((endTime - Date.now()) / 1000);
+        if (remainingSec <= 0) break;
+        if (theme) {
+          _ctx?.ui?.setStatus?.(
+            "429-retry",
+            theme.fg("dim", `Rate limited (429). Waiting ${remainingSec}s before retry ${attempts}/${MAX_RETRIES}...`)
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
-
-      // 通知用户
-      _ctx?.ui?.notify?.(
-        `⏳ Rate limited (429). Waiting ${formatTime(waitSec)} before retry ${attempts}/${MAX_RETRIES}...`,
-        "warning"
-      );
-
-      // 等待指定时间
-      await new Promise((resolve) => setTimeout(resolve, actualWaitMs));
 
       // 重试请求
       response = await currentFetch.call(globalThis, input, init);
     }
 
-    // 如果之前被限流但现在恢复正常，更新状态
+    // 如果之前被限流但现在恢复正常，静默清除状态
     if (isRateLimited && response.status !== 429 && !isRewrittenRateLimit(response)) {
       isRateLimited = false;
       retryCount = 0;
-
-      const theme = _ctx?.ui?.theme;
-      if (theme) {
-        _ctx?.ui?.setStatus?.(
-          "429-retry",
-          theme.fg("success", `✓ Rate limit cleared after ${attempts} retries`)
-        );
-
-        // 5秒后清除状态
-        setTimeout(() => {
-          if (!isRateLimited) {
-            _ctx?.ui?.setStatus?.("429-retry", undefined);
-          }
-        }, 5000);
-      }
-
-      _ctx?.ui?.notify?.("✓ Rate limit cleared, continuing...", "info");
+      _ctx?.ui?.setStatus?.("429-retry", undefined);
     }
 
     // 如果达到最大重试次数仍然 429
@@ -214,14 +194,9 @@ export default function (pi: ExtensionAPI) {
       if (theme) {
         _ctx?.ui?.setStatus?.(
           "429-retry",
-          theme.fg("error", `✗ Rate limit persists after ${MAX_RETRIES} retries`)
+          theme.fg("dim", `Rate limit persists after ${MAX_RETRIES} retries`)
         );
       }
-
-      _ctx?.ui?.notify?.(
-        `✗ Rate limit persists after ${MAX_RETRIES} retries. Please wait and try again later.`,
-        "error"
-      );
     }
 
     return response;
@@ -284,7 +259,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`429 retry wait time set to ${seconds}s`, "info");
           ctx.ui.setStatus(
             "429-retry",
-            theme.fg("success", `✓ 429 retry: ${enabled ? "ON" : "OFF"} (${seconds}s)`)
+            theme.fg("dim", `429 retry: ${enabled ? "ON" : "OFF"} (${seconds}s)`)
           );
         } else {
           ctx.ui.notify("Wait time must be > 0", "error");
@@ -320,8 +295,8 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus(
         "429-retry",
         enabled
-          ? theme.fg("success", `✓ 429 retry: ON (${waitMs / 1000}s)`)
-          : theme.fg("muted", "✗ 429 retry: OFF")
+          ? theme.fg("dim", `429 retry: ON (${waitMs / 1000}s)`)
+          : theme.fg("dim", "429 retry: OFF")
       );
     },
   });
