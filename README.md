@@ -34,18 +34,6 @@ Then reload pi:
 
 ## Extensions
 
-### 📦 compact-tool
-
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/0c8fbd7d-36f0-418a-923a-5a68e409ab6a" height="400">
-</p>
-
-Inspired by Codex style.
-
-**File:** `compact-tool.ts`
-
----
-
 ### ✏️ editor
 
 ![editor](https://github.com/user-attachments/assets/890dc61a-e42e-42ea-860d-ea0809f2ab12)
