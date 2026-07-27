@@ -62,10 +62,13 @@ export class TokenSpeedEngine {
    */
   get ttftSec(): number {
     // First token has arrived — show the frozen measured value
-    if (this._firstTokenArrived) return this._ttftMs / 1000;
+    if (this._firstTokenArrived) {
+      return this._ttftMs / 1000;
+    }
     // Waiting for first token — live count-up from http request start
     if (this._isStreaming && this._httpRequestStartTime > 0) {
-      return (Date.now() - this._httpRequestStartTime) / 1000;
+      const live = (Date.now() - this._httpRequestStartTime) / 1000;
+      return live;
     }
     return this._ttftMs / 1000;
   }
@@ -83,7 +86,8 @@ export class TokenSpeedEngine {
     // Finished — use real provider-reported tokens (time frozen at finish())
     if (this._finished && this._realOutputTokens > 0) {
       const elapsed = this.elapsedMs;
-      return elapsed === 0 ? 0 : this._realOutputTokens / (elapsed / 1000);
+      const result = elapsed === 0 ? 0 : this._realOutputTokens / (elapsed / 1000);
+      return result;
     }
 
     // Streaming — sliding window

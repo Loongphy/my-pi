@@ -1,39 +1,19 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { ExtensionAPI, ExtensionContext, ModelSelectEvent } from "@earendil-works/pi-coding-agent";
 
 // ============================================================
 // Configuration
 // ============================================================
-const DEFAULT_MAX_KB = 512;
-
 const CWD = process.cwd();
 const SESSION_DIR_NAME = `--${CWD.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 const REQUESTS_DIR = resolve(homedir(), ".pi", "agent", "requests");
-const MAX_BYTES = (parseInt(process.env.PI_REQUEST_LOG_MAX_KB || "", 10) || DEFAULT_MAX_KB) * 1024;
 
 // Per-session log file (set on session_start)
 let currentLogFile = "";
 function getLogFile(): string {
   return currentLogFile || join(REQUESTS_DIR, `${SESSION_DIR_NAME}.request.log`);
-}
-
-const KEEP_SESSION_LOGS = 10;
-function cleanupOldLogs(): void {
-  try {
-    const dir = join(REQUESTS_DIR, SESSION_DIR_NAME);
-    if (!existsSync(dir)) return;
-    const files = readdirSync(dir)
-      .filter(f => f.startsWith("requests-") && f.endsWith(".log"))
-      .sort()
-      .reverse();
-    if (files.length > KEEP_SESSION_LOGS) {
-      for (const f of files.slice(KEEP_SESSION_LOGS)) {
-        unlinkSync(join(dir, f));
-      }
-    }
-  } catch { /* silent */ }
 }
 
 // ============================================================
@@ -133,18 +113,22 @@ function appendLog(text: string): void {
     const file = getLogFile();
     const line = text.endsWith("\n") ? text : text + "\n";
     appendFileSync(file, line, "utf-8");
-    if (statSync(file).size > MAX_BYTES) rollLog();
   } catch { /* silent */ }
 }
 
-function rollLog(): void {
-  try {
-    const file = getLogFile();
-    if (!existsSync(file)) return;
-    const content = readFileSync(file, "utf-8");
-    const lines = content.split("\n");
-    writeFileSync(file, lines.slice(Math.floor(lines.length / 2)).join("\n"), "utf-8");
-  } catch { /* silent */ }
+/** True if `err` is a user/SDK-initiated fetch abort — skip noisy TUI notifications. */
+function isAbortError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { name?: string; code?: number; message?: string };
+  if (e.name === "AbortError") return true;
+  // DOMException.ABORT_ERR === 20
+  if (e.code === 20) return true;
+  // Some Node fetch impls use these messages
+  if (typeof e.message === "string" && /aborted/i.test(e.message)) {
+    // Make sure it's not a network error that happens to contain "aborted"
+    if (e.name === "Error" && /aborted/i.test(e.message)) return true;
+  }
+  return false;
 }
 
 // ============================================================
@@ -257,9 +241,42 @@ if (typeof _underlyingFetch === "function") {
                 bodyEntries.push(["messages", `≈${fmtBytes(totalChars)}`]);
               }
 
-              const shownKeys = new Set(["model", "messages"]);
-              const otherCount = Object.keys(parsed).filter(k => !shownKeys.has(k)).length;
-              if (otherCount > 0) bodyEntries.push(["…", "…"]);
+              // --- Reasoning / thinking parameters ---
+
+              // OpenAI / DeepSeek: reasoning_effort at top level
+              if (parsed.reasoning_effort) {
+                bodyEntries.push(["reasoning_effort", String(parsed.reasoning_effort)]);
+              }
+
+
+
+              // Anthropic / MIMO / DeepSeek (via extra_body): thinking object
+              if (parsed.thinking && typeof parsed.thinking === "object") {
+                const t = parsed.thinking as Record<string, unknown>;
+                if (t.type) bodyEntries.push(["thinking.type", String(t.type)]);
+              }
+
+              // Anthropic / DeepSeek (Anthropic endpoint): output_config.effort
+              if (parsed.output_config && typeof parsed.output_config === "object") {
+                const oc = parsed.output_config as Record<string, unknown>;
+                if (oc.effort) bodyEntries.push(["output_config.effort", String(oc.effort)]);
+              }
+
+              // Remaining keys summary (replaces the old "… …" placeholder)
+              const shownKeys = new Set([
+                "model", "messages",
+                "reasoning_effort",
+                "thinking", "output_config",
+                "system", "tools", "tool_choice", "stop",
+                "temperature", "top_p",
+                "frequency_penalty", "presence_penalty",
+                "response_format", "seed", "user", "n",
+                "metadata", "store", "service_tier",
+              ]);
+              const otherKeys = Object.keys(parsed).filter(k => !shownKeys.has(k));
+              if (otherKeys.length > 0) {
+                bodyEntries.push(["…", `${otherKeys.length} keys`]);
+              }
 
               if (bodyEntries.length > 0) {
                 bodySection = `│ body:\n` +
@@ -374,7 +391,11 @@ if (typeof _underlyingFetch === "function") {
           if (isProviderReq && !isDuplicate) {
             const errMsg = err instanceof Error ? err.message : String(err);
             appendLog(`[${ts}] FETCH ERROR: ${sanitizeError(errMsg)}`);
-            _tuiCtx?.ui.notify(`🌐 Network error: ${sanitizeError(errMsg)}`, "error");
+            // Skip TUI notification for user-initiated aborts (Esc/Ctrl+C).
+            // The error is still written to the log file for diagnostics.
+            if (!isAbortError(err)) {
+              _tuiCtx?.ui.notify(`🌐 Network error: ${sanitizeError(errMsg)}`, "error");
+            }
           }
           throw err;
         }
@@ -431,7 +452,6 @@ export default function (pi: ExtensionAPI): void {
     const sessionDir = join(REQUESTS_DIR, SESSION_DIR_NAME);
     if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
     currentLogFile = join(sessionDir, `requests-${ts}-${sessionId}.log`);
-    cleanupOldLogs();
 
     appendLog(`[${new Date().toISOString()}] SESSION START (session_id=${sessionId}, cwd=${CWD})`);
   });

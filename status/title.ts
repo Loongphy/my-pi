@@ -24,10 +24,6 @@ export interface TitleState {
   activeCtx: ExtensionContext | null;
 }
 
-export function createTitleState(): TitleState {
-  return { titleTimer: null, frameIndex: 0, activeCtx: null };
-}
-
 // ── Title builders ──
 
 function getTitleParts(pi: ExtensionAPI) {

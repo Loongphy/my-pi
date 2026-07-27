@@ -20,7 +20,6 @@ import type {
   ExtensionContext,
   SessionEntry,
   Theme,
-  WorkingIndicatorOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 
@@ -37,8 +36,6 @@ import {
 import { TokenSpeedEngine } from "./tps.ts";
 import type { StatusLineConfig } from "./header.ts";
 import {
-  SPINNER_FRAMES,
-  buildWorkingTitle,
   buildIdleTitle,
   startTitleAnimation,
   stopTitleAnimation,
@@ -56,9 +53,6 @@ interface AppState {
   // Agent lifecycle
   isWorking: boolean;
   isRetrying: boolean;
-  isThinking: boolean;
-  turnStartMs: number | null;
-  lastTurnDurationMs: number | null;
   workingMessageTimer: ReturnType<typeof setInterval> | null;
   agentStartMs: number | null;
 
@@ -89,9 +83,6 @@ function createInitialState(): AppState {
     activeCtx: null,
     isWorking: false,
     isRetrying: false,
-    isThinking: false,
-    turnStartMs: null,
-    lastTurnDurationMs: null,
     workingMessageTimer: null,
     agentStartMs: null,
     isAutoTitling: false,
@@ -125,25 +116,13 @@ function formatDuration(ms: number, prefix: string): string {
   return `${prefix} ${[h > 0 && `${h}h`, m > 0 && `${m}m`, `${s}s`].filter(Boolean).join(" ")}`;
 }
 
-function buildWorkingIndicator(): WorkingIndicatorOptions {
-  const colors = [
-    "\x1b[38;2;255;179;186m", "\x1b[38;2;255;223;186m",
-    "\x1b[38;2;255;255;186m", "\x1b[38;2;186;255;201m",
-    "\x1b[38;2;186;225;255m", "\x1b[38;2;218;186;255m",
-  ];
-  const reset = "\x1b[39m";
-  return {
-    frames: SPINNER_FRAMES.map((f, i) => `${colors[i % colors.length]!}${f}${reset}`),
-    intervalMs: 80,
-  };
-}
-
-function showTurnDuration(ctx: ExtensionContext, durationMs: number) {
-  ctx.ui.setWorkingMessage(formatDuration(durationMs, "Worked for"));
-  ctx.ui.setWorkingVisible(true);
-}
-
 // ── Working message timer ──
+//
+// NOTE: We only ever update the working *message* via setWorkingMessage().
+// pi owns the working loader lifecycle (created on agent_start, cleared on
+// agent_end / compaction / retry). We must NOT call setWorkingVisible(true)
+// from a timer or from tool events to "keep the row alive" — see
+// startWorkingMessage below for why that freezes the TUI.
 
 function startWorkingMessage(ctx: ExtensionContext, state: AppState) {
   if (state.workingMessageTimer) return;
@@ -151,6 +130,24 @@ function startWorkingMessage(ctx: ExtensionContext, state: AppState) {
   ctx.ui.setWorkingMessage(formatDuration(0, "Working for"));
   state.workingMessageTimer = setInterval(() => {
     if (state.agentStartMs === null) return;
+    // Only update the text. setWorkingMessage() updates the loader when pi
+    // has one on screen and is a harmless no-op when it does not.
+    //
+    // The previous implementation called ctx.ui.setWorkingVisible(true) here
+    // to "recreate the loader when it's missing". That is not safe: pi's
+    // setWorkingVisible(true), while streaming, force-replaces whatever
+    // status indicator is currently shown (retry countdown, auto-compaction,
+    // branch summary, or a transiently-cleared container) with a brand-new
+    // WorkingStatusIndicator. Each replacement constructs a new Loader that
+    // starts its own 80ms animation interval and requests a render, and it
+    // can leave a working loader alive in states where pi expects it to be
+    // cleared. Fired every second (and on every tool_execution_start) this
+    // fights pi's indicator state machine and drives a near-continuous
+    // render loop. Because every render recomputes the status header — which
+    // walks all session entries (computeTokenStats x2 + computeLastCacheRate)
+    // plus getContextUsage() — the event loop gets pinned on long sessions
+    // and the TUI becomes unresponsive ("卡死"). Letting pi own the loader
+    // and only updating the text removes the conflict entirely.
     ctx.ui.setWorkingMessage(formatDuration(Date.now() - state.agentStartMs, "Working for"));
   }, 1_000);
 }
@@ -401,15 +398,8 @@ export default function (pi: ExtensionAPI) {
     state.isRetrying = true;
   });
 
-  pi.on("auto_retry_end", async (_event, ctx) => {
+  pi.on("auto_retry_end", async (_event) => {
     state.isRetrying = false;
-    // On successful retry, the working loader may have been cleared by
-    // interactive-mode's statusContainer.clear(). Restore it so the
-    // "Working for XXs" display continues smoothly.
-    if (_event.success && state.agentStartMs !== null) {
-      ctx.ui.setWorkingMessage(formatDuration(Date.now() - state.agentStartMs, "Working for"));
-      ctx.ui.setWorkingVisible(true);
-    }
   });
 
   // ── Session lifecycle ──
@@ -424,8 +414,11 @@ export default function (pi: ExtensionAPI) {
 
     state.lastAgentDuration = null;
 
-    // Set working indicator (rainbow spinner)
-    ctx.ui.setWorkingIndicator(buildWorkingIndicator());
+    // Use pi's built-in working indicator (accent-colored braille spinner) so
+    // the symbol in front of "Working for XXs" matches pi exactly. We
+    // intentionally do NOT call setWorkingIndicator() with a custom spinner:
+    // overriding it diverges from pi's look and needlessly rebuilds the
+    // loader. The elapsed-time text is supplied via setWorkingMessage().
     ctx.ui.setTitle(buildIdleTitle(pi));
 
     // Initial git refresh + start fs.watch on .git state
@@ -458,7 +451,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_start", async (_event, ctx) => {
     const wasAlreadyWorking = state.isWorking;
     state.isWorking = true;
-    state.isThinking = true;
     state.lastAgentDuration = null;
     startTitleAnimation(pi, ctx, state);
     // Only reset the timer on fresh starts, not on retry recovery
@@ -469,7 +461,6 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", async (_event, ctx) => {
     state.isWorking = false;
-    state.isThinking = false;
     stopTitleAnimation(ctx, state);
     ctx.ui.setTitle(buildIdleTitle(pi));
 
@@ -481,7 +472,6 @@ export default function (pi: ExtensionAPI) {
     const elapsedMs =
       state.agentStartMs !== null ? Date.now() - state.agentStartMs : null;
     state.agentStartMs = null;
-    state.lastTurnDurationMs = null;
 
     if (elapsedMs !== null) {
       const total = Math.round(elapsedMs / 1000);
@@ -501,32 +491,27 @@ export default function (pi: ExtensionAPI) {
   // ── Turn lifecycle ──
 
   pi.on("turn_start", async (_event, ctx) => {
-    state.turnStartMs = Date.now();
-    state.isThinking = true;
     if (state.isWorking) {
       updateTitleFrame(pi, ctx, state);
-    }
-  });
-
-  pi.on("turn_end", async (_event, ctx) => {
-    state.isThinking = false;
-    if (state.turnStartMs !== null) {
-      state.lastTurnDurationMs = Date.now() - state.turnStartMs;
-      state.turnStartMs = null;
     }
   });
 
   // ── Tool execution ──
 
   pi.on("tool_execution_start", async (_event, ctx) => {
-    state.isThinking = false;
     if (state.isWorking && state.titleTimer) {
       updateTitleFrame(pi, ctx, state);
+    }
+    // Refresh the elapsed-time text only. Do NOT call setWorkingVisible(true)
+    // here: force-recreating pi's status indicator on every tool start fights
+    // pi's indicator lifecycle and can freeze the TUI (see startWorkingMessage).
+    // setWorkingMessage() is a no-op when pi has no active working loader.
+    if (state.isWorking && state.agentStartMs !== null) {
+      ctx.ui.setWorkingMessage(formatDuration(Date.now() - state.agentStartMs, "Working for"));
     }
   });
 
   pi.on("tool_execution_end", async (_event, ctx) => {
-    state.isThinking = true;
     if (state.isWorking && state.titleTimer) {
       updateTitleFrame(pi, ctx, state);
     }
