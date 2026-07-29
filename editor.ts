@@ -83,7 +83,14 @@ class CodexComposer extends CustomEditor {
 		// Drop the bold `❯` prompt into the left gutter of the first text row
 		// (the row just below the top border), replacing one padding space so the
 		// row width is unchanged. Codex renders the prompt as bold default-fg.
-		lines[1] = `${this.piTheme.bold(PROMPT_CHAR)}${lines[1].slice(1)}`;
+		// When the input starts with `!` (bash mode), pi highlights the editor
+		// border with the `bashMode` theme color (green). Since we replaced the
+		// border with a filled panel, we highlight the `❯` prompt instead.
+		const isBashMode = this.getText().trimStart().startsWith("!");
+		const prompt = isBashMode
+			? this.piTheme.fg("bashMode", this.piTheme.bold(PROMPT_CHAR))
+			: this.piTheme.bold(PROMPT_CHAR);
+		lines[1] = `${prompt}${lines[1].slice(1)}`;
 
 		// Fill the whole panel — top border, text rows, and bottom border. Filling
 		// the top and bottom rows (not just the text) is what vertically centers
