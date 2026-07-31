@@ -308,21 +308,6 @@ if (typeof _underlyingFetch === "function") {
 
           // Log original 429 before rewriting (so logs show real status)
           const isRateLimited = response.status === 429 && url.includes("opencode.ai");
-          if (isProviderReq && !isDuplicate && isRateLimited) {
-            const respHeaders: Record<string, string> = {};
-            response.headers.forEach((v, k) => { respHeaders[k] = v; });
-            const rhLines = Object.entries(respHeaders)
-              .map(([k, v]) => `    ${k.padEnd(24)} ${v}`)
-              .join("\n");
-            appendLog(
-              `[${ts}] RESPONSE 429 (rewritten to 400 by rate-limit workaround)` +
-              `\n│ header:\n${rhLines}\n└─`
-            );
-            _tuiCtx?.ui.notify(`🚫 Provider rate-limited (HTTP 429)`, "error");
-          }
-
-          // 429 workaround for opencode.ai: rewrite to 400 with reset time
-          // SDK sleeps for exact retry-after with no cap, causing pi to hang.
           if (isRateLimited) {
             const seconds = parseRetryAfter(
               response.headers.get("retry-after"),
@@ -330,7 +315,37 @@ if (typeof _underlyingFetch === "function") {
             );
             const limitMs = seconds != null && seconds > 0 ? seconds * 1000 : 60_000;
             const timeStr = formatTime(Math.ceil(limitMs / 1000));
-            response = new Response(`Usage limit reached: Resets in ${timeStr}`, {
+
+            // Preserve the provider's error type (e.g. FreeUsageLimitError / GoUsageLimitError).
+            // The SDK matches this marker to classify the error as a non-retryable limit,
+            // so it stops the agent immediately instead of retrying.
+            let errType = "FreeUsageLimitError";
+            try {
+              const cloned = response.clone();
+              const txt = await cloned.text();
+              const m = txt.match(/\b([A-Za-z]*UsageLimitError|insufficient_quota)\b/);
+              if (m) errType = m[1];
+            } catch { /* ignore unreadable body */ }
+
+            if (isProviderReq && !isDuplicate) {
+              const respHeaders: Record<string, string> = {};
+              response.headers.forEach((v, k) => { respHeaders[k] = v; });
+              const rhLines = Object.entries(respHeaders)
+                .map(([k, v]) => `    ${k.padEnd(24)} ${v}`)
+                .join("\n");
+              appendLog(
+                `[${ts}] RESPONSE 429 (${errType}, resets in ${timeStr}; rewritten to 400)` +
+                `\n│ header:\n${rhLines}\n└─`
+              );
+            }
+
+            // 429 → 400 rewrite: originally used to bypass the SDK's unbounded
+            // retry-after sleep on 429 (pi#3671/pi#4666). pi now calls the SDK with
+            // maxRetries: 0, so the hang is fixed upstream. The rewrite is kept for
+            // formatting: it carries the retry-after reset time into the error message.
+            const body = `Usage limit reached (${errType}): Resets in ${timeStr}`;
+            _lastErrorBody = body;
+            response = new Response(body, {
               status: 400,
               statusText: "Usage Limited",
               headers: { "content-type": "text/plain" },

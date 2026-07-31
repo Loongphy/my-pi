@@ -20,6 +20,11 @@ const DEFAULT_WAIT_MS = 30_000; // 30 秒
 // 最大重试次数（防止无限循环）
 const MAX_RETRIES = 10;
 
+// 重置窗口超过此值即视为“硬限制”，立即失败（不重试）。
+// 例如 opencode.ai 免费档 FreeUsageLimitError 的重置时间以小时计，重试毫无意义，
+// 应尽快让上层 SDK 抛出错误、停止 agent 并展示重置时间。
+const HARD_LIMIT_WAIT_MS = 10 * 60 * 1000; // 10 分钟
+
 export default function (pi: ExtensionAPI) {
   // 状态
   let enabled = true;
@@ -108,6 +113,28 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
+   * 检测“硬”用量限制（不可重试）。
+   *
+   * 例如 opencode.ai 免费档的 FreeUsageLimitError，重置时间在数小时之后。
+   * 这种情况下重试毫无意义，应当立即失败，把原始响应交还给上层 SDK，
+   * 让它抛出错误并停止 agent（同时展示重置时间），而不是空转约 100 分钟。
+   */
+  async function isHardUsageLimit(response: Response, rawWaitMs: number): Promise<boolean> {
+    // 信号 1：响应 body 中含有明确的不可重试错误类型
+    try {
+      const cloned = response.clone();
+      const body = await cloned.text();
+      if (/FreeUsageLimitError|GoUsageLimitError|UsageLimitError|insufficient_quota|Monthly usage limit/i.test(body)) {
+        return true;
+      }
+    } catch {
+      // 忽略 body 读取失败
+    }
+    // 信号 2：重置窗口超过上限——在合理重试窗口内不会恢复
+    return rawWaitMs > HARD_LIMIT_WAIT_MS;
+  }
+
+  /**
    * 格式化时间为人类可读格式
    */
   function formatTime(seconds: number): string {
@@ -139,28 +166,34 @@ export default function (pi: ExtensionAPI) {
 
     // 检查是否为 429 响应（原始或改写后的）
     while ((response.status === 429 || isRewrittenRateLimit(response)) && attempts < MAX_RETRIES) {
+      // 解析服务器请求的等待时间（未封顶）
+      const rawWaitMs = response.status === 429
+        ? (parseWaitTimeFromResponse(response) ?? waitMs)
+        : await extractWaitTimeFromRewrittenResponse(response);
+
+      // 硬用量限制（如 opencode.ai 免费档，重置时间在数小时后）：立即失败，
+      // 把原始响应交还上层 SDK，让它抛出错误并停止 agent（同时展示重置时间），
+      // 而不是空转约 100 分钟做无意义的重试。
+      if (await isHardUsageLimit(response, rawWaitMs)) {
+        const theme = _ctx?.ui?.theme;
+        if (theme) {
+          _ctx?.ui?.setStatus?.(
+            "429-retry",
+            theme.fg("dim", "Usage limit reached — surfacing error (no retry)")
+          );
+        }
+        isRateLimited = false;
+        return response;
+      }
+
       attempts++;
       isRateLimited = true;
       lastRateLimitTime = Date.now();
       retryCount = attempts;
 
-      // 解析等待时间
-      let actualWaitMs: number;
-
-      if (response.status === 429) {
-        // 原始 429 响应
-        actualWaitMs = parseWaitTimeFromResponse(response) ?? waitMs;
-      } else {
-        // 改写后的 400 响应
-        actualWaitMs = await extractWaitTimeFromRewrittenResponse(response);
-      }
-
-      // 确保等待时间至少为 1 秒
-      actualWaitMs = Math.max(actualWaitMs, 1000);
-
-      // 限制最大等待时间（防止过长等待）
-      const maxWaitMs = 10 * 60 * 1000; // 10 分钟
-      actualWaitMs = Math.min(actualWaitMs, maxWaitMs);
+      // 确保等待时间至少为 1 秒，并封顶防止过长等待
+      let actualWaitMs = Math.max(rawWaitMs, 1000);
+      actualWaitMs = Math.min(actualWaitMs, HARD_LIMIT_WAIT_MS);
 
       // 倒计时显示（原地更新同一行，不累积）
       const theme = _ctx?.ui?.theme;
