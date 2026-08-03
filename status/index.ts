@@ -74,6 +74,12 @@ interface AppState {
   gitWatcher: fs.FSWatcher | null;
   gitWatchCwd: string | null;
   gitPollTimer: ReturnType<typeof setInterval> | null;
+
+  // Self-event suppression: our own refresh runs git commands that can
+  // write .git state (e.g. the index). Those writes fire our watcher and
+  // must not schedule another refresh, or the loop never terminates.
+  gitRefreshInFlight: boolean;
+  lastGitRefreshEndMs: number;
 }
 
 function createInitialState(): AppState {
@@ -96,6 +102,8 @@ function createInitialState(): AppState {
     gitWatcher: null,
     gitWatchCwd: null,
     gitPollTimer: null,
+    gitRefreshInFlight: false,
+    lastGitRefreshEndMs: 0,
   };
 }
 
@@ -107,6 +115,10 @@ const emptyFooter = () => ({
 });
 
 // ── Helpers ──
+
+// Grace window after a self-triggered refresh during which watcher events
+// are assumed to be fallout from our own git commands and ignored.
+const GIT_SELF_EVENT_GRACE_MS = 1_000;
 
 function formatDuration(ms: number, prefix: string): string {
   const total = Math.round(ms / 1000);
@@ -285,8 +297,14 @@ export default function (pi: ExtensionAPI) {
   // ── git refresh helpers ──
 
   const doRefreshGit = async (cwd: string) => {
-    state.gitStatus = await collectGitStatus(cwd, pi.exec.bind(pi));
-    state.activeTui?.requestRender();
+    state.gitRefreshInFlight = true;
+    try {
+      state.gitStatus = await collectGitStatus(cwd, pi.exec.bind(pi));
+      state.activeTui?.requestRender();
+    } finally {
+      state.gitRefreshInFlight = false;
+      state.lastGitRefreshEndMs = Date.now();
+    }
   };
 
   const scheduleGitRefresh = (cwd: string) => {
@@ -306,6 +324,13 @@ export default function (pi: ExtensionAPI) {
     state.gitWatchCwd = cwd;
 
     const onChange = () => {
+      // Suppress events caused by our own refresh: even with
+      // --no-optional-locks on git status, other commands or races can
+      // write .git state while we refresh. Ignoring in-flight events and a
+      // short grace window afterwards prevents a self-sustaining
+      // watch -> refresh -> watch loop.
+      if (state.gitRefreshInFlight) return;
+      if (Date.now() - state.lastGitRefreshEndMs < GIT_SELF_EVENT_GRACE_MS) return;
       // Debounce: multiple fs events fire for a single git operation
       scheduleGitRefresh(cwd);
     };
@@ -360,7 +385,9 @@ export default function (pi: ExtensionAPI) {
   /** Fallback periodic polling for platforms where fs.watch is unreliable (WSL, Docker). */
   const startGitPolling = (cwd: string) => {
     if (state.gitPollTimer) return;
-    // Poll every 5s as a safety net (tested: git status takes ~10ms)
+    // Safety net only: fs.watch covers real-time updates. Kept slow (15s)
+    // because each poll spawns 4-5 git processes and triggers a full header
+    // render, which is expensive on long sessions.
     state.gitPollTimer = setInterval(() => {
       if (state.gitWatchCwd !== cwd) {
         // cwd changed, stop polling
@@ -371,7 +398,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       void doRefreshGit(cwd);
-    }, 5_000);
+    }, 15_000);
   };
 
   // ── Widget update helpers ──

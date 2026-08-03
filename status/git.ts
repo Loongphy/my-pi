@@ -61,8 +61,14 @@ export async function collectGitStatus(
     let conflicted = 0;
     let untracked = 0;
 
+    // --no-optional-locks: without it, git status refreshes the index and
+    // rewrites .git/index (via index.lock). That write fires the .git fs.watch
+    // in the status extension, which schedules another refresh — a
+    // self-sustaining loop (~300ms period: 4-5 git spawns + a full render per
+    // cycle) that pins the event loop and freezes the TUI on long sessions.
+    // The flag makes status skip the index write; output is identical.
     const statusResult = await execFn(
-      "git", ["status", "--porcelain=2", "--untracked-files=normal"], { cwd },
+      "git", ["--no-optional-locks", "status", "--porcelain=2", "--untracked-files=normal"], { cwd },
     ).catch(() => undefined);
     if (statusResult?.stdout) {
       for (const line of statusResult.stdout.split("\n")) {

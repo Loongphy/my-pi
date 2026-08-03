@@ -217,8 +217,14 @@ export function buildStatusHeader(
     }
 
     // 4. Token stats: ↑ tokens ↓ tokens
-    if (config.tokenStats) {
-        const stats = computeTokenStats(ctx);
+    //
+    // computeTokenStats walks ALL session entries — compute it once and
+    // reuse for both token stats and cache rate. Recomputing per section
+    // triples the per-render cost and pins the event loop on long sessions.
+    const stats = (config.tokenStats || config.cacheRate)
+        ? computeTokenStats(ctx)
+        : null;
+    if (config.tokenStats && stats) {
         const statStrs: string[] = [];
         if (stats.totalInput)
             statStrs.push(`\u2191${formatTokens(stats.totalInput)}`);
@@ -236,8 +242,7 @@ export function buildStatusHeader(
     // 4b. Cache hit rate: cumulative / last request
     // Only show when usage data is available (e.g. after at least one assistant response).
     // On /reload or resume, session data loaded from disk provides the same source.
-    if (config.cacheRate) {
-        const stats = computeTokenStats(ctx);
+    if (config.cacheRate && stats) {
         const hasUsageData = stats.totalInput > 0 || stats.totalCacheRead > 0;
         if (hasUsageData) {
             const cumDenom = stats.totalCacheRead + stats.totalInput;
