@@ -19,9 +19,22 @@ import type {
     ExtensionAPI,
     ExtensionContext,
     Theme,
+    ThemeColor,
 } from "@earendil-works/pi-coding-agent";
 import type { GitStatus } from "./git.ts";
 import { TokenSpeedEngine } from "./tps.ts";
+
+// ── Thinking level → theme color ──
+
+const THINKING_LEVEL_COLORS: Record<string, ThemeColor> = {
+    off: "thinkingOff",
+    minimal: "thinkingMinimal",
+    low: "thinkingLow",
+    medium: "thinkingMedium",
+    high: "thinkingHigh",
+    xhigh: "thinkingXhigh",
+    max: "thinkingMax",
+};
 
 // ── Token formatting (mirrors pi's built-in footer) ──
 
@@ -179,8 +192,7 @@ export function buildStatusHeader(
         let modelPart = theme.fg("accent", `\uEE9C ${ctx.model.id}`);
         if (config.thinking && ctx.model.reasoning) {
             const level = pi.getThinkingLevel();
-            const thinkColor =
-                `thinking${level.charAt(0).toUpperCase() + level.slice(1)}` as const;
+            const thinkColor = THINKING_LEVEL_COLORS[level] ?? "thinkingText";
             modelPart += ` ${theme.fg(thinkColor, level)}`;
         }
         parts.push(modelPart);

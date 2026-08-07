@@ -1,0 +1,26 @@
+{
+	"name": "@loongphy/my-pi",
+	"version": "0.1.0",
+	"description": "A collection of pi extensions for an enhanced coding experience",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Loongphy/my-pi.git"
+	},
+	"files": [
+		"editor.ts",
+		"request-logger.ts",
+		"shortcuts.ts",
+		"429-retry.ts",
+		"status/"
+	],
+	"pi": {
+		"extensions": [
+			"./editor.ts",
+			"./request-logger.ts",
+			"./shortcuts.ts",
+			"./429-retry.ts",
+			"./status/"
+		]
+	}
+}

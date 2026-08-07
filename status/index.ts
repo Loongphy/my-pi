@@ -13,7 +13,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { complete } from "@earendil-works/pi-ai";
+import { complete } from "@earendil-works/pi-ai/compat";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type {
   ExtensionAPI,
@@ -168,6 +168,47 @@ function stopWorkingMessage(ctx: ExtensionContext, state: AppState) {
   if (state.workingMessageTimer) { clearInterval(state.workingMessageTimer); state.workingMessageTimer = null; }
   state.agentStartMs = null;
   ctx.ui.setWorkingMessage();
+}
+
+// ── Retry lifecycle helpers ──
+//
+// pi does not surface auto_retry_start / auto_retry_end to extensions (those
+// AgentSessionEvents drive only the built-in TUI retry countdown). Retries are
+// instead detected from agent_end: a run whose last assistant message ends with
+// stopReason "error" is normally followed by pi's auto-retry (or a compaction
+// continuation), so the working timer is kept alive and the next agent_start
+// continues the same counter instead of restarting at 0s. agent_settled closes
+// the timer out when no continuation ever starts (max retries hit, aborted
+// backoff, non-retryable error).
+
+/** True when the run's last assistant message ended in error. */
+function endsWithError(messages: Array<{ role?: string; stopReason?: string }>): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === "assistant") return m.stopReason === "error";
+  }
+  return false;
+}
+
+/** Stop the working timer and record the total elapsed duration (agent_start → now). */
+function finishWorking(ctx: ExtensionContext, state: AppState) {
+  if (state.workingMessageTimer) {
+    clearInterval(state.workingMessageTimer);
+    state.workingMessageTimer = null;
+  }
+  const elapsedMs = state.agentStartMs !== null ? Date.now() - state.agentStartMs : null;
+  state.agentStartMs = null;
+
+  if (elapsedMs !== null) {
+    const total = Math.round(elapsedMs / 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    state.lastAgentDuration = [h > 0 && `${h}h`, m > 0 && `${m}m`, `${s}s`].filter(Boolean).join(" ");
+  } else {
+    ctx.ui.setWorkingMessage();
+    ctx.ui.setWorkingVisible(false);
+  }
 }
 
 // ── Auto title generation ──
@@ -421,13 +462,9 @@ export default function (pi: ExtensionAPI) {
   };
 
   // ── Retry lifecycle — keep timer running across retries ──
-  pi.on("auto_retry_start", async (_event) => {
-    state.isRetrying = true;
-  });
-
-  pi.on("auto_retry_end", async (_event) => {
-    state.isRetrying = false;
-  });
+  // Retry detection lives in the agent_start / agent_end / agent_settled
+  // handlers below (see the helpers above). pi's auto_retry_* events are not
+  // bridged to extensions, so listening to them here would be a silent no-op.
 
   // ── Session lifecycle ──
 
@@ -438,6 +475,7 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setFooter(emptyFooter);
 
     state.isAutoTitling = false;
+    state.isRetrying = false;
 
     state.lastAgentDuration = null;
 
@@ -477,42 +515,47 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", async (_event, ctx) => {
     const wasAlreadyWorking = state.isWorking;
+    const isRetryRecovery = state.isRetrying;
+    state.isRetrying = false; // consume the retry flag
     state.isWorking = true;
     state.lastAgentDuration = null;
     startTitleAnimation(pi, ctx, state);
-    // Only reset the timer on fresh starts, not on retry recovery
-    if (!wasAlreadyWorking && !state.isRetrying) {
+    // Only reset the timer on fresh starts; retry/continuation attempts keep
+    // the same elapsed-time counter running across attempts.
+    if (!wasAlreadyWorking && !isRetryRecovery) {
       startWorkingMessage(ctx, state);
     }
   });
 
-  pi.on("agent_end", async (_event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
     state.isWorking = false;
     stopTitleAnimation(ctx, state);
     ctx.ui.setTitle(buildIdleTitle(pi));
 
-    // 停止计时器，记录总耗时（从 agent_start 到 agent_end）
-    if (state.workingMessageTimer) {
-      clearInterval(state.workingMessageTimer);
-      state.workingMessageTimer = null;
+    // A run ending in error is normally followed by pi's auto-retry or a
+    // compaction continuation. Keep the working timer running so the next
+    // agent_start continues the same counter; agent_settled finalizes the
+    // duration if no continuation ever starts.
+    if (endsWithError(event.messages)) {
+      state.isRetrying = true;
+      return;
     }
-    const elapsedMs =
-      state.agentStartMs !== null ? Date.now() - state.agentStartMs : null;
-    state.agentStartMs = null;
 
-    if (elapsedMs !== null) {
-      const total = Math.round(elapsedMs / 1000);
-      const h = Math.floor(total / 3600);
-      const m = Math.floor((total % 3600) / 60);
-      const s = total % 60;
-      state.lastAgentDuration = [h > 0 && `${h}h`, m > 0 && `${m}m`, `${s}s`].filter(Boolean).join(" ");
-    } else {
-      ctx.ui.setWorkingMessage();
-      ctx.ui.setWorkingVisible(false);
-    }
+    // 正常结束：停止计时器，记录总耗时（从 agent_start 到 agent_end）
+    finishWorking(ctx, state);
     immediateUpdate(ctx);
     autoGenerateTitle(pi, ctx, state);
     scheduleGitRefresh(ctx.cwd);
+  });
+
+  // 一轮 agent 完全结束（无自动重试/压缩/排队续跑会再启动）。若曾标记重试但
+  // 从未有新的 agent_start 消费（重试耗尽、退避被中断、或非可重试错误），
+  // 在这里收尾计时器，避免 "Working for" 一直挂起。
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (!state.isRetrying) return;
+    state.isRetrying = false;
+    finishWorking(ctx, state);
+    immediateUpdate(ctx);
   });
 
   // ── Turn lifecycle ──

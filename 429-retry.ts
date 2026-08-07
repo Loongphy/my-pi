@@ -4,6 +4,10 @@
  * 当 API 返回 429 (Too Many Requests) 时，等待指定时间后自动重试，
  * 而不是让请求失败或被 SDK 无限挂起。
  *
+ * 重试等待时间默认按递增序列增长（5s, 10s, 20s, 30s, 60s, 90s, ...，
+ * 到达 30s 后每次 +30s），避免指数退避拖长无意义的等待；
+ * 也可通过 /429-retry <seconds> 设为固定值。
+ *
  * 通过 /429-retry 命令可以启用/关闭此功能。
  *
  * 与 request-logger 插件兼容：
@@ -14,15 +18,15 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-// 默认重试等待时间（毫秒）
-const DEFAULT_WAIT_MS = 30_000; // 30 秒
+// 递增重试等待序列（秒）：5, 10, 20, 30, 60, 90, 120, ...
+// 到达 30s 后每次固定 +30s，避免指数退避把无意义的等待拖得太长。
+const RETRY_WAIT_SEQUENCE_SECONDS = [5, 10, 20, 30];
 
 // 最大重试次数（防止无限循环）
 const MAX_RETRIES = 10;
 
-// 重置窗口超过此值即视为“硬限制”，立即失败（不重试）。
-// 例如 opencode.ai 免费档 FreeUsageLimitError 的重置时间以小时计，重试毫无意义，
-// 应尽快让上层 SDK 抛出错误、停止 agent 并展示重置时间。
+// 重置窗口超过此值即视为"硬限制"，立即失败（不重试）。
+// 判定依据（错误标记的来源与逻辑）详见 isHardUsageLimit()。
 const HARD_LIMIT_WAIT_MS = 10 * 60 * 1000; // 10 分钟
 
 export default function (pi: ExtensionAPI) {
@@ -31,7 +35,8 @@ export default function (pi: ExtensionAPI) {
   let isRateLimited = false;
   let lastRateLimitTime: number | null = null;
   let retryCount = 0;
-  let waitMs = DEFAULT_WAIT_MS;
+  // 用户通过 /429-retry <seconds> 显式设置的固定等待时间（null = 使用递增序列）
+  let customWaitMs: number | null = null;
   let _ctx: ExtensionContext | null = null;
 
   // 保存当前的 fetch（可能是 request-logger 的包装版本）
@@ -66,6 +71,29 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
+   * 计算第 attempt 次重试前的等待时间（毫秒）。
+   *
+   * 默认按递增序列：5s, 10s, 20s, 30s, 60s, 90s, 120s, ...（到达 30s 后
+   * 每次 +30s），避免指数退避让无意义的重试拖太长；若用户通过
+   * /429-retry <seconds> 显式设置了固定等待时间，则优先使用固定值。
+   */
+  function getRetryWaitMs(attempt: number): number {
+    if (customWaitMs !== null) {
+      return customWaitMs;
+    }
+    if (attempt <= RETRY_WAIT_SEQUENCE_SECONDS.length) {
+      return RETRY_WAIT_SEQUENCE_SECONDS[attempt - 1] * 1000;
+    }
+    const base = RETRY_WAIT_SEQUENCE_SECONDS[RETRY_WAIT_SEQUENCE_SECONDS.length - 1];
+    return (base + (attempt - RETRY_WAIT_SEQUENCE_SECONDS.length) * 30) * 1000;
+  }
+
+  /** 当前等待策略的人类可读描述（用于状态栏） */
+  function describeWaitStrategy(): string {
+    return customWaitMs !== null ? `${customWaitMs / 1000}s` : "5,10,20,30,60,90...+30s/次";
+  }
+
+  /**
    * 检查响应是否为 request-logger 改写后的 429
    * request-logger 将 429 改写为 400，body 包含 "Usage limit reached"
    */
@@ -82,7 +110,7 @@ export default function (pi: ExtensionAPI) {
   /**
    * 从改写后的响应中提取等待时间
    */
-  async function extractWaitTimeFromRewrittenResponse(response: Response): Promise<number> {
+  async function extractWaitTimeFromRewrittenResponse(response: Response, attempt: number): Promise<number> {
     try {
       const cloned = response.clone();
       const body = await cloned.text();
@@ -108,16 +136,22 @@ export default function (pi: ExtensionAPI) {
       // 忽略解析错误
     }
 
-    // 默认等待时间
-    return waitMs;
+    // 默认等待时间（按递增序列）
+    return getRetryWaitMs(attempt);
   }
 
   /**
-   * 检测“硬”用量限制（不可重试）。
+   * 检测"硬"用量限制（不可重试）——命中即快速失败，不进入重试循环。
    *
-   * 例如 opencode.ai 免费档的 FreeUsageLimitError，重置时间在数小时之后。
-   * 这种情况下重试毫无意义，应当立即失败，把原始响应交还给上层 SDK，
-   * 让它抛出错误并停止 agent（同时展示重置时间），而不是空转约 100 分钟。
+   * 判定依据（与 pi 上游 isTerminalRateLimitError 的错误分类一致）：
+   * 1. 响应 body 携带不可重试的用量限制错误标记。这些标记源自 opencode.ai
+   *    （Codex 兼容接口）的错误类型：FreeUsageLimitError（免费档）、
+   *    GoUsageLimitError（Go 档）等；insufficient_quota 亦是 OpenAI 的通用
+   *    quota 错误码。按 body 文本匹配，对任何 provider 生效（无 URL 门控）。
+   * 2. 重置窗口超过 HARD_LIMIT_WAIT_MS（10 分钟）——在合理重试窗口内不会恢复。
+   *
+   * 命中后：把原始响应交还上层 SDK，让它抛出错误并停止 agent（错误信息含
+   * 重置时间），而不是空转最多约 100 分钟（10 次 × 10 分钟）做无意义的重试。
    */
   async function isHardUsageLimit(response: Response, rawWaitMs: number): Promise<boolean> {
     // 信号 1：响应 body 中含有明确的不可重试错误类型
@@ -166,14 +200,13 @@ export default function (pi: ExtensionAPI) {
 
     // 检查是否为 429 响应（原始或改写后的）
     while ((response.status === 429 || isRewrittenRateLimit(response)) && attempts < MAX_RETRIES) {
-      // 解析服务器请求的等待时间（未封顶）
+      // 解析服务器请求的等待时间（未封顶）；服务器未给出时按递增序列
       const rawWaitMs = response.status === 429
-        ? (parseWaitTimeFromResponse(response) ?? waitMs)
-        : await extractWaitTimeFromRewrittenResponse(response);
+        ? (parseWaitTimeFromResponse(response) ?? getRetryWaitMs(attempts + 1))
+        : await extractWaitTimeFromRewrittenResponse(response, attempts + 1);
 
-      // 硬用量限制（如 opencode.ai 免费档，重置时间在数小时后）：立即失败，
-      // 把原始响应交还上层 SDK，让它抛出错误并停止 agent（同时展示重置时间），
-      // 而不是空转约 100 分钟做无意义的重试。
+      // 硬用量限制（判定见 isHardUsageLimit）：立即失败，把原始响应交还上层
+      // SDK，让它抛出错误并停止 agent（同时展示重置时间），而不是空转重试。
       if (await isHardUsageLimit(response, rawWaitMs)) {
         const theme = _ctx?.ui?.theme;
         if (theme) {
@@ -288,7 +321,7 @@ export default function (pi: ExtensionAPI) {
       if (arg && /^\d+$/.test(arg)) {
         const seconds = parseInt(arg, 10);
         if (seconds > 0) {
-          waitMs = seconds * 1000;
+          customWaitMs = seconds * 1000;
           ctx.ui.notify(`429 retry wait time set to ${seconds}s`, "info");
           ctx.ui.setStatus(
             "429-retry",
@@ -328,7 +361,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus(
         "429-retry",
         enabled
-          ? theme.fg("dim", `429 retry: ON (${waitMs / 1000}s)`)
+          ? theme.fg("dim", `429 retry: ON (${describeWaitStrategy()})`)
           : theme.fg("dim", "429 retry: OFF")
       );
     },
@@ -340,7 +373,7 @@ export default function (pi: ExtensionAPI) {
     const theme = ctx.ui.theme;
     ctx.ui.setStatus(
       "429-retry",
-      theme.fg("dim", `429 retry: ${enabled ? "ON" : "OFF"}`)
+      theme.fg("dim", `429 retry: ${enabled ? "ON" : "OFF"} (${describeWaitStrategy()})`)
     );
 
     // 3秒后隐藏初始状态（如果没有被限流）

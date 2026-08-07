@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { homedir } from "node:os";
-import type { ExtensionAPI, ExtensionContext, ModelSelectEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ============================================================
 // Configuration
@@ -89,6 +89,102 @@ function sanitizeUrl(url: string): string {
 
 function sanitizeError(msg: string): string {
   return msg.replace(/(sk-|tp-)[a-zA-Z0-9_-]{10,}/g, "$1***");
+}
+
+// ============================================================
+// Network error detail extraction
+//
+// Node's fetch throws `TypeError: fetch failed` whose real cause
+// (ECONNREFUSED / ENOTFOUND / ETIMEDOUT / TLS cert errors, ...) is
+// hidden in `err.cause`. The OpenAI-style SDKs then wrap it into
+// `APIConnectionError` with a generic "Connection error." message.
+// Walk the cause chain so TUI notifications and logs show the
+// specific failure instead of the generic wrapper message.
+// ============================================================
+
+interface CodedError extends Error {
+  code?: string | number;
+  errno?: string;
+  syscall?: string;
+  address?: string;
+  port?: number | string;
+  hostname?: string;
+  cause?: unknown;
+}
+
+/** Messages that carry no diagnostic value; the real cause is in `cause`. */
+const GENERIC_NETWORK_MESSAGES = new Set([
+  "fetch failed",
+  "Failed to fetch",
+  "failed to fetch",
+  "Connection error.",
+  "connection error",
+  "Request failed",
+  "request failed",
+  "Network Error",
+  "network error",
+  "NetworkError",
+  "socket hang up",
+]);
+
+/** Format one error level into a short diagnostic string, or null when generic. */
+function formatErrorDetail(e: CodedError): string | null {
+  const code = e.code != null ? String(e.code) : e.errno;
+  // Numeric codes are DOMException status codes (0/20 = abort), not network diagnostics
+  const hasCode = !!code && code !== "ERR_FETCH_FAILED" && code !== "UND_ERR_REQ_INIT" && !/^\d+$/.test(code);
+  const msg = (e.message || "").trim();
+
+  if (msg && !GENERIC_NETWORK_MESSAGES.has(msg)) {
+    // Messages like "connect ETIMEDOUT 1.2.3.4:443" / "getaddrinfo ENOTFOUND host"
+    // already carry full detail; otherwise prepend the code for context
+    // (e.g. TLS: "DEPTH_ZERO_SELF_SIGNED_CERT: unable to verify the first certificate").
+    if (hasCode && !msg.includes(code as string)) return `${code}: ${msg}`;
+    return msg;
+  }
+  if (hasCode) {
+    const bits: string[] = [code as string];
+    if (e.syscall) bits.push(e.syscall);
+    const host = e.hostname || e.address;
+    if (host) bits.push(e.address && e.port != null ? `${e.address}:${e.port}` : String(host));
+    return bits.join(" ");
+  }
+  return null;
+}
+
+/**
+ * Walk the `cause` chain and return the root-most specific description,
+ * or null when every level is generic (e.g. a bare AbortError).
+ */
+function rootCauseDetail(err: unknown): string | null {
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  let detail: string | null = null;
+  while (current != null && !seen.has(current)) {
+    seen.add(current);
+    if (typeof current === "string") {
+      if (!GENERIC_NETWORK_MESSAGES.has(current)) detail = current;
+      break;
+    }
+    if (typeof current !== "object") break;
+    const d = formatErrorDetail(current as CodedError);
+    if (d) detail = d; // keep walking: the root-most cause wins
+    const next = (current as CodedError).cause;
+    if (next === current) break;
+    current = next;
+  }
+  return detail;
+}
+
+/** Full description for logs: "fetch failed → connect ETIMEDOUT 1.2.3.4:443". */
+function describeNetworkError(err: unknown): string {
+  const top = err instanceof Error && err.message ? err.message.trim() : "";
+  const detail = rootCauseDetail(err);
+  if (detail) {
+    // "Error" is Node's default placeholder for empty messages — skip it
+    if (!top || detail === top || top === "Error") return detail;
+    return `${top} → ${detail}`;
+  }
+  return top || (err instanceof Error ? err.message : String(err));
 }
 
 function sanitizeHeaders(headers: Record<string, string>): Record<string, string> {
@@ -404,11 +500,14 @@ if (typeof _underlyingFetch === "function") {
           return response;
         } catch (err) {
           if (isProviderReq && !isDuplicate) {
-            const errMsg = err instanceof Error ? err.message : String(err);
+            // Include the root cause (err.cause chain) instead of the generic
+            // "fetch failed"/"Connection error." wrapper messages.
+            const errMsg = describeNetworkError(err);
             appendLog(`[${ts}] FETCH ERROR: ${sanitizeError(errMsg)}`);
             // Skip TUI notification for user-initiated aborts (Esc/Ctrl+C).
             // The error is still written to the log file for diagnostics.
             if (!isAbortError(err)) {
+              const detail = rootCauseDetail(err);
               _tuiCtx?.ui.notify(`🌐 Network error: ${sanitizeError(errMsg)}`, "error");
             }
           }
@@ -459,20 +558,27 @@ export default function (pi: ExtensionAPI): void {
     }
   });
 
-  // Log session start — create per-session file
+  // Log session start — create per-session file.
+  // 命名与 pi session 文件完全一致（<ts>_<sessionId>.jsonl），保留 requests- 前缀：
+  // requests-<ts>_<sessionId>.log。直接用 session 文件 basename 派生，
+  // 保证时间戳/id 与 session 文件零偏差。
   pi.on("session_start", (_event, ctx) => {
     _tuiCtx = ctx;
-    const sessionId = process.env.OPENCODE_SESSION_ID || "unknown";
-    const ts = new Date().toISOString().replace(/[:.]/g, "-");
     const sessionDir = join(REQUESTS_DIR, SESSION_DIR_NAME);
     if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
-    currentLogFile = join(sessionDir, `requests-${ts}-${sessionId}.log`);
 
-    appendLog(`[${new Date().toISOString()}] SESSION START (session_id=${sessionId}, cwd=${CWD})`);
+    // 优先从 session 文件派生；临时/内存会话无文件时回退为手工拼接
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    const base = sessionFile
+      ? basename(sessionFile, ".jsonl")
+      : `${new Date().toISOString().replace(/[:.]/g, "-")}_${ctx.sessionManager.getSessionId()}`;
+    currentLogFile = join(sessionDir, `requests-${base}.log`);
+
+    appendLog(`[${new Date().toISOString()}] SESSION START (session_id=${ctx.sessionManager.getSessionId()}, cwd=${CWD})`);
   });
 
   // Log model switches
-  pi.on("model_select", (event: ModelSelectEvent, ctx) => {
+  pi.on("model_select", (event, ctx) => {
     _tuiCtx = ctx;
     const modelStr = `${event.model.provider}/${event.model.id}`;
     appendLog(`[${new Date().toISOString()}] MODEL ${modelStr} (${event.source})`);
