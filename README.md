@@ -101,15 +101,3 @@ Logs every provider request to `~/.pi/agent/requests/<session>.request.log` — 
 `Ctrl+Shift+C` copies the current editor content to the system clipboard.
 
 **File:** `shortcuts.ts`
-
----
-
-### 429-retry
-
-![429 limit](https://github.com/user-attachments/assets/907d920d-5d20-4193-b298-416179fc0c69)
-
-Retries transient HTTP 429 responses automatically (any provider): waits clamped to 1s–10min, up to 10 attempts, with a live status-bar countdown. Hard usage limits fail fast — the agent stops with the reset time instead.
-
-**Command:** `/429-retry` toggles on/off · `/429-retry <seconds>` sets the default wait when the response carries no `retry-after` (default 30s)
-
-**File:** `429-retry.ts`
