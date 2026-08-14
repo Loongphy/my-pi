@@ -183,136 +183,177 @@ export function buildStatusHeader(
     data: HeaderRenderData,
     config: StatusLineConfig,
     theme: Theme,
+    width?: number,
 ): string[] {
-    const parts: string[] = [];
     const sep = theme.fg("borderMuted", " \u2502 ");
 
-    // 1. Model + Thinking:  gpt-5.5 low (no separator)
-    if (config.model && ctx.model) {
-        let modelPart = theme.fg("accent", `\uEE9C ${ctx.model.id}`);
-        if (config.thinking && ctx.model.reasoning) {
-            const level = pi.getThinkingLevel();
-            const thinkColor = THINKING_LEVEL_COLORS[level] ?? "thinkingText";
-            modelPart += ` ${theme.fg(thinkColor, level)}`;
-        }
-        parts.push(modelPart);
-    }
+    // ── Expensive session-wide computation, done ONCE per render ──
+    //
+    // computeTokenStats walks ALL session entries. It must NOT run inside
+    // the candidate loop below — each extra walk triples the per-render
+    // cost and pins the event loop on long sessions.
+    const stats = (config.tokenStats || config.cacheRate)
+        ? computeTokenStats(ctx)
+        : null;
+    const hasUsageData = stats
+        ? stats.totalInput > 0 || stats.totalCacheRead > 0
+        : false;
+    const lastRate =
+        config.cacheRate && stats && hasUsageData
+            ? computeLastCacheRate(ctx)
+            : null;
 
-    // 2. Working directory:  /path
+    // ── Working directory: longest → shortest candidates ──
+    //
+    // When the assembled line does not fit the available width, shrink the
+    // directory first (full path → basename → omitted) instead of chopping
+    // the right edge. The trailing segments (cache rate, context usage,
+    // token speed) are the live/interesting part and must survive narrow
+    // terminals; the full cwd is the least critical piece on a narrow
+    // screen. Right-edge truncation in the widget render stays as the
+    // final safety net.
+    const dirCandidates: Array<string | null> = [];
     if (config.currentDir) {
         let dir = ctx.cwd;
         const home = process.env.HOME || process.env.USERPROFILE;
         if (home && dir.startsWith(home)) dir = `~${dir.slice(home.length)}`;
-        parts.push(theme.fg("success", `\uF07C ${dir}`));
+        dirCandidates.push(dir);
+        const base = path.basename(dir);
+        if (base && base !== dir) dirCandidates.push(base);
+        dirCandidates.push(null); // last resort: drop the directory
+    } else {
+        dirCandidates.push(null);
     }
 
-    // 3. Git branch + badges:  main ↑2 ↓1 +5 ?3
-    if (config.gitBranch && data.gitStatus) {
-        const git = data.gitStatus;
-        let branchStr = `\uF418 ${git.branch}`;
-        const badges: string[] = [];
-        // ahead: ↑N green
-        if (git.ahead > 0)
-            badges.push(theme.fg("success", `\u2191${git.ahead}`));
-        // behind: ↓N red
-        if (git.behind > 0)
-            badges.push(theme.fg("error", `\u2193${git.behind}`));
-        // changed (staged + modified + deleted + conflicted): +N yellow
-        const changed =
-            git.staged + git.modified + git.deleted + git.conflicted;
-        if (changed > 0) badges.push(theme.fg("warning", `+${changed}`));
-        // untracked: ?N red
-        if (git.untracked > 0)
-            badges.push(theme.fg("error", `?${git.untracked}`));
-        if (badges.length > 0) branchStr += " " + badges.join(" ");
-        parts.push(theme.fg("text", branchStr));
-    }
+    const buildLine = (dir: string | null): string => {
+        const parts: string[] = [];
 
-    // 4. Token stats: ↑ tokens ↓ tokens
-    //
-    // computeTokenStats walks ALL session entries — compute it once and
-    // reuse for both token stats and cache rate. Recomputing per section
-    // triples the per-render cost and pins the event loop on long sessions.
-    const stats = (config.tokenStats || config.cacheRate)
-        ? computeTokenStats(ctx)
-        : null;
-    if (config.tokenStats && stats) {
-        const statStrs: string[] = [];
-        if (stats.totalInput)
-            statStrs.push(`\u2191${formatTokens(stats.totalInput)}`);
-        if (stats.totalOutput)
-            statStrs.push(`\u2193${formatTokens(stats.totalOutput)}`);
-        if (stats.totalCacheRead)
-            statStrs.push(`R${formatTokens(stats.totalCacheRead)}`);
-        if (stats.totalCacheWrite)
-            statStrs.push(`W${formatTokens(stats.totalCacheWrite)}`);
-        if (statStrs.length > 0) {
-            parts.push(theme.fg("muted", statStrs.join(" ")));
+        // 1. Model + Thinking:  gpt-5.5 low (no separator)
+        if (config.model && ctx.model) {
+            let modelPart = theme.fg("accent", `\uEE9C ${ctx.model.id}`);
+            if (config.thinking && ctx.model.reasoning) {
+                const level = pi.getThinkingLevel();
+                const thinkColor = THINKING_LEVEL_COLORS[level] ?? "thinkingText";
+                modelPart += ` ${theme.fg(thinkColor, level)}`;
+            }
+            parts.push(modelPart);
         }
-    }
 
-    // 4b. Cache hit rate: cumulative / last request
-    // Only show when usage data is available (e.g. after at least one assistant response).
-    // On /reload or resume, session data loaded from disk provides the same source.
-    if (config.cacheRate && stats) {
-        const hasUsageData = stats.totalInput > 0 || stats.totalCacheRead > 0;
-        if (hasUsageData) {
+        // 2. Working directory:  /path (basename or omitted on narrow widths)
+        if (dir) {
+            parts.push(theme.fg("success", `\uF07C ${dir}`));
+        }
+
+        // 3. Git branch + badges:  main ↑2 ↓1 +5 ?3
+        if (config.gitBranch && data.gitStatus) {
+            const git = data.gitStatus;
+            let branchStr = `\uF418 ${git.branch}`;
+            const badges: string[] = [];
+            // ahead: ↑N green
+            if (git.ahead > 0)
+                badges.push(theme.fg("success", `\u2191${git.ahead}`));
+            // behind: ↓N red
+            if (git.behind > 0)
+                badges.push(theme.fg("error", `\u2193${git.behind}`));
+            // changed (staged + modified + deleted + conflicted): +N yellow
+            const changed =
+                git.staged + git.modified + git.deleted + git.conflicted;
+            if (changed > 0) badges.push(theme.fg("warning", `+${changed}`));
+            // untracked: ?N red
+            if (git.untracked > 0)
+                badges.push(theme.fg("error", `?${git.untracked}`));
+            if (badges.length > 0) branchStr += " " + badges.join(" ");
+            parts.push(theme.fg("text", branchStr));
+        }
+
+        // 4. Token stats: ↑ tokens ↓ tokens
+        // (stats precomputed once above — see buildStatusHeader)
+        if (config.tokenStats && stats) {
+            const statStrs: string[] = [];
+            if (stats.totalInput)
+                statStrs.push(`\u2191${formatTokens(stats.totalInput)}`);
+            if (stats.totalOutput)
+                statStrs.push(`\u2193${formatTokens(stats.totalOutput)}`);
+            if (stats.totalCacheRead)
+                statStrs.push(`R${formatTokens(stats.totalCacheRead)}`);
+            if (stats.totalCacheWrite)
+                statStrs.push(`W${formatTokens(stats.totalCacheWrite)}`);
+            if (statStrs.length > 0) {
+                parts.push(theme.fg("muted", statStrs.join(" ")));
+            }
+        }
+
+        // 4b. Cache hit rate: cumulative / last request
+        // Only show when usage data is available (e.g. after at least one assistant response).
+        // On /reload or resume, session data loaded from disk provides the same source.
+        if (config.cacheRate && stats && hasUsageData) {
             const cumDenom = stats.totalCacheRead + stats.totalInput;
             const cumRate = cumDenom > 0 ? stats.totalCacheRead / cumDenom : 0;
-            const lastRate = computeLastCacheRate(ctx);
             const cumPct = (cumRate * 100).toFixed(1);
             const lastPct =
                 lastRate !== null ? (lastRate * 100).toFixed(1) : "—";
             const cacheStr = `Cache ${cumPct}%/last ${lastPct}%`;
             parts.push(theme.fg("muted", cacheStr));
         }
-    }
 
-    // 5. Context usage: 54%/128K or colored at high thresholds
-    if (config.contextUsage) {
-        const usage = ctx.getContextUsage();
-        const contextWindow =
-            usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-        const contextPct = usage?.percent;
-        const contextTokens = usage?.tokens;
-        let ctxStr: string;
-        if (
-            contextPct !== null &&
-            contextPct !== undefined &&
-            contextTokens !== null &&
-            contextTokens !== undefined
-        ) {
-            ctxStr = `${contextPct.toFixed(0)}% ${formatTokens(contextTokens)}/${formatTokens(contextWindow)}`;
-        } else if (contextPct !== null && contextPct !== undefined) {
-            ctxStr = `${contextPct.toFixed(0)}%/${formatTokens(contextWindow)}`;
-        } else {
-            ctxStr = `?/${formatTokens(contextWindow)}`;
-        }
-        if (contextPct !== null && contextPct !== undefined) {
-            if (contextPct > 90) {
-                parts.push(theme.fg("error", ctxStr));
-            } else if (contextPct > 70) {
-                parts.push(theme.fg("warning", ctxStr));
+        // 5. Context usage: 54%/128K or colored at high thresholds
+        if (config.contextUsage) {
+            const usage = ctx.getContextUsage();
+            const contextWindow =
+                usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+            const contextPct = usage?.percent;
+            const contextTokens = usage?.tokens;
+            let ctxStr: string;
+            if (
+                contextPct !== null &&
+                contextPct !== undefined &&
+                contextTokens !== null &&
+                contextTokens !== undefined
+            ) {
+                ctxStr = `${contextPct.toFixed(0)}% ${formatTokens(contextTokens)}/${formatTokens(contextWindow)}`;
+            } else if (contextPct !== null && contextPct !== undefined) {
+                ctxStr = `${contextPct.toFixed(0)}%/${formatTokens(contextWindow)}`;
+            } else {
+                ctxStr = `?/${formatTokens(contextWindow)}`;
+            }
+            if (contextPct !== null && contextPct !== undefined) {
+                if (contextPct > 90) {
+                    parts.push(theme.fg("error", ctxStr));
+                } else if (contextPct > 70) {
+                    parts.push(theme.fg("warning", ctxStr));
+                } else {
+                    parts.push(theme.fg("muted", ctxStr));
+                }
             } else {
                 parts.push(theme.fg("muted", ctxStr));
             }
-        } else {
-            parts.push(theme.fg("muted", ctxStr));
+        }
+
+        // 6. Token speed + TTFT (no separator between them, both accent colour)
+        if (config.tokenSpeed && data.tokenSpeedEngine.tps > 0) {
+            let speedStr = `\u{F04C5} ${data.tokenSpeedEngine.tps.toFixed(0)} t/s`;
+            if (config.ttft && data.tokenSpeedEngine.ttftSec > 0) {
+                speedStr += ` TTFT ${data.tokenSpeedEngine.ttftSec.toFixed(1)}s`;
+            }
+            parts.push(theme.fg("accent", speedStr));
+        }
+
+        if (parts.length === 0) return "";
+        return parts.join(sep);
+    };
+
+    // Pick the first candidate that fits the available width. When width is
+    // not provided (or ≤ 0) keep the historical behavior (full path, no fit
+    // check) — the widget render truncates as the final safety net.
+    let chosen = "";
+    for (const dir of dirCandidates) {
+        const line = buildLine(dir);
+        chosen = line;
+        if (width === undefined || width <= 0 || visibleWidth(line) <= width) {
+            break;
         }
     }
-
-    // 6. Token speed + TTFT (no separator between them, both accent colour)
-    if (config.tokenSpeed && data.tokenSpeedEngine.tps > 0) {
-        let speedStr = `\u{F04C5} ${data.tokenSpeedEngine.tps.toFixed(0)} t/s`;
-        if (config.ttft && data.tokenSpeedEngine.ttftSec > 0) {
-            speedStr += ` TTFT ${data.tokenSpeedEngine.ttftSec.toFixed(1)}s`;
-        }
-        parts.push(theme.fg("accent", speedStr));
-    }
-
-    if (parts.length === 0) return [""];
-    const line = parts.join(sep);
-    return [line];
+    return [chosen];
 }
 
 // ── Status line config items (for /statusline command) ──

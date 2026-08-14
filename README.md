@@ -108,8 +108,16 @@ Logs every provider request to `~/.pi/agent/requests/<session>.request.log` — 
 
 ![429 limit](https://github.com/user-attachments/assets/907d920d-5d20-4193-b298-416179fc0c69)
 
-Retries transient HTTP 429 responses automatically (any provider): waits clamped to 1s–10min, up to 10 attempts, with a live status-bar countdown. Hard usage limits fail fast — the agent stops with the reset time instead.
+Retries transient HTTP 429 responses automatically (any provider). The wait follows an incremental sequence — 5s, 10s, 20s, 30s, 60s, 90s, ... (+30s per retry after 30s), up to 15 attempts, or the server's `Retry-After` / body reset time when provided — with a live status-bar countdown. Hard limits fail fast: a wait longer than 10 min, or a provider's permanent-limit signature (e.g. workbuddy quota exhausted, opencode usage-limit errors), surfaces the response immediately with the reset time instead of retrying.
 
-**Command:** `/429-retry` toggles on/off · `/429-retry <seconds>` sets the default wait when the response carries no `retry-after` (default 30s)
+**Command:** `/429-retry` toggles on/off · `/429-retry <seconds>` sets a fixed wait time for every retry
 
 **File:** `429-retry.ts`
+
+---
+
+### thinking-level-memory
+
+Remembers the last thinking level per model and restores it automatically when you switch back via `/model`, the model selector, or model cycling. Models without a remembered level are raised to their highest supported level (any of the built-in levels: minimum, low, medium, high, xhigh, max) whenever the current level is below it — so switching from a model that only supports `high` to one that supports `max` lands on `max`, never on the inherited `high`. If the level is already at the new model's ceiling, it stays as-is. Manual changes always update the memory. Priority: remembered level → scoped `--models model:level` → max default.
+
+**File:** `thinking-level-memory.ts`

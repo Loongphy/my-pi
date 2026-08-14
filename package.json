@@ -12,7 +12,8 @@
 		"request-logger.ts",
 		"shortcuts.ts",
 		"429-retry.ts",
-		"status/"
+		"status/",
+		"thinking-level-memory.ts"
 	],
 	"pi": {
 		"extensions": [
@@ -20,7 +21,8 @@
 			"./request-logger.ts",
 			"./shortcuts.ts",
 			"./429-retry.ts",
-			"./status/"
+			"./status/",
+			"./thinking-level-memory.ts"
 		]
 	}
 }

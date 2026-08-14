@@ -1,52 +1,133 @@
 /**
  * 429 Rate Limit Retry Plugin
  *
- * 当 API 返回 429 (Too Many Requests) 时，等待指定时间后自动重试，
- * 而不是让请求失败或被 SDK 无限挂起。
+ * When the API returns 429 (Too Many Requests), wait a computed amount of
+ * time and retry automatically, instead of letting the request fail or hang
+ * forever inside the SDK.
  *
- * 重试等待时间默认按递增序列增长（5s, 10s, 20s, 30s, 60s, 90s, ...，
- * 到达 30s 后每次 +30s），避免指数退避拖长无意义的等待；
- * 也可通过 /429-retry <seconds> 设为固定值。
+ * The default wait sequence grows linearly (5s, 10s, 20s, 30s, 60s, 90s, ...
+ * then +30s per retry after 30s) to avoid pointless exponential backoff; a
+ * fixed wait can be set with /429-retry <seconds>.
  *
- * 通过 /429-retry 命令可以启用/关闭此功能。
+ * Use the /429-retry command to toggle the feature on/off.
  *
- * 与 request-logger 插件兼容：
- * - request-logger 会将 429 改写为 400（防止 SDK 挂起）
- * - 本插件检测改写后的 400 响应，提取等待时间并重试
- * - 两者协作工作，不会冲突
+ * Cooperation with the request-logger plugin (unified 429 flow):
+ * - request-logger only logs/monitors; 429 responses pass through untouched
+ * - this plugin retries every 429 at the fetch layer (default sequence
+ *   5s,10s,20s,30s,60s,90s... +30s each, up to MAX_RETRIES times)
+ * - 429 ownership is decided by URL gating (see RATE_LIMIT_RULES): when a
+ *   provider's permanent/hard-limit signature matches, the original response
+ *   is handed back untouched and the provider handles it (workbuddy raises a
+ *   purchase prompt, the opencode SDK classifies the error by marker);
+ *   unowned/unmatched 429s are always retried by default. UI output belongs
+ *   to the provider; this plugin never oversteps.
+ *
+ * NOTE: this file is intentionally pure ASCII. Older versions mixed in
+ * non-ASCII characters (CJK comments, em dashes) that show up as mojibake in
+ * some terminals/editors. The Chinese literals below are kept ONLY inside the
+ * workbuddy regex patterns, because Tencent's quota-exhausted responses are
+ * actually matched in Chinese.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-// 递增重试等待序列（秒）：5, 10, 20, 30, 60, 90, 120, ...
-// 到达 30s 后每次固定 +30s，避免指数退避把无意义的等待拖得太长。
+// Incremental retry wait sequence (seconds): 5, 10, 20, 30, 60, 90, 120, ...
+// After 30s each retry adds a fixed +30s, so pointless waits do not explode.
 const RETRY_WAIT_SEQUENCE_SECONDS = [5, 10, 20, 30];
 
-// 最大重试次数（防止无限循环）
-const MAX_RETRIES = 10;
+// Maximum retry count (guards against infinite loops). With the default
+// sequence 5,10,20,30,60,90...+30s each, 15 retries take ~40 minutes at most;
+// ownership rules / the generic hard-limit check (shouldReturnResponse) exit
+// early, so the budget is rarely exhausted.
+const MAX_RETRIES = 15;
 
-// 重置窗口超过此值即视为"硬限制"，立即失败（不重试）。
-// 判定依据（错误标记的来源与逻辑）详见 isHardUsageLimit()。
-const HARD_LIMIT_WAIT_MS = 10 * 60 * 1000; // 10 分钟
+// ============================================================
+// 429 ownership rules (URL gating; no global keyword fallback)
+//
+// One rule per provider: `match` decides "whose request is this", `isTerminal`
+// decides "is this provider's 429 permanent/hard-limit" (hit -> hand the
+// original response back, no retry). Requests matching no rule -> retry by
+// default (5,10,20,30,60,90...+30s, max 15 times). Business handling (purchase
+// prompts, error classification, UI output) always stays in the provider's own
+// code.
+// ============================================================
+
+interface RateLimitRule {
+  name: string; // provider name (shown in the status bar)
+  match(url: string): boolean;
+  isTerminal(body: string): boolean;
+}
+
+/** Extract the error code from a 429 body (handles error.data.code / error.code wrappers). */
+function extractErrorCode(body: string): number | undefined {
+  try {
+    const parsed = JSON.parse(body) as Record<string, unknown>;
+    const err = (parsed?.error ?? parsed) as Record<string, unknown>;
+    const data = (err?.data ?? {}) as Record<string, unknown>;
+    return (data?.code ?? err?.code) as number | undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const RATE_LIMIT_RULES: RateLimitRule[] = [
+  // workbuddy (CodeBuddy CN): quota exhausted = code 14018 / quota wording.
+  // Aligned with workbuddy dist's isQuotaExhausted; under URL gating it is
+  // safe to match "usage limit" (that wording only appears on
+  // copilot.tencent.com and cannot misfire on other providers).
+  // NOTE: keep the Chinese terms below as UTF-8 bytes - Tencent's error
+  // bodies are in Chinese and must be matched literally.
+  {
+    name: "workbuddy",
+    match: (url) => url.includes("copilot.tencent.com"),
+    isTerminal: (body) => {
+      if (extractErrorCode(body) === 14018) return true;
+      return /额度已用尽|加量包|quota exhausted|insufficient_quota|usage limit/i.test(body);
+    },
+  },
+  // opencode (Codex-compatible endpoint): usage-limit error types (same
+  // classification as pi upstream's isTerminalRateLimitError); on hit the
+  // response is handed back and the SDK reports by marker.
+  {
+    name: "opencode",
+    match: (url) => /opencode\.ai/i.test(url),
+    isTerminal: (body) =>
+      /FreeUsageLimitError|GoUsageLimitError|UsageLimitError|insufficient_quota|Monthly usage limit/i.test(body),
+  },
+  // trae-work: no trustworthy permanent-429 signature yet (code 1001 is an
+  // auth expiry handled by the trae plugin itself), so no rule -> default
+  // retry. Add a rule here once a signature is found.
+];
+
+// A server-requested wait longer than this is treated as a hard limit and
+// handed back immediately (no retry) - pure HTTP semantics
+// (Retry-After / body reset time), applied to any request, independent of
+// any provider signature.
+const HARD_LIMIT_WAIT_MS = 10 * 60 * 1000; // 10 minutes
 
 export default function (pi: ExtensionAPI) {
-  // 状态
+  // State
   let enabled = true;
   let isRateLimited = false;
   let lastRateLimitTime: number | null = null;
   let retryCount = 0;
-  // 用户通过 /429-retry <seconds> 显式设置的固定等待时间（null = 使用递增序列）
+  // Fixed wait time explicitly set by the user via /429-retry <seconds>
+  // (null = use the incremental sequence)
   let customWaitMs: number | null = null;
   let _ctx: ExtensionContext | null = null;
 
-  // 保存当前的 fetch（可能是 request-logger 的包装版本）
+  // Keep a reference to the current fetch (possibly request-logger's wrapper)
   const currentFetch = globalThis.fetch;
 
   /**
-   * 从响应中解析等待时间
+   * Parse the wait time (ms) requested by the response.
+   *
+   * Prefers the Retry-After / retry-after-ms headers; when both are missing,
+   * falls back to parsing the reset time from the body (e.g. opencode.ai's
+   * "Usage limit reached: Resets in 1h 2m 3s").
    */
-  function parseWaitTimeFromResponse(response: Response): number | null {
-    // 检查 Retry-After 头
+  async function parseWaitTimeFromResponse(response: Response): Promise<number | null> {
+    // Check Retry-After headers
     const retryAfter = response.headers.get("Retry-After");
     const retryAfterMs = response.headers.get("retry-after-ms");
 
@@ -59,7 +140,7 @@ export default function (pi: ExtensionAPI) {
       const seconds = parseInt(retryAfter, 10);
       if (!isNaN(seconds) && seconds >= 0) return seconds * 1000;
 
-      // 尝试解析为 HTTP-date
+      // Try parsing as HTTP-date
       const date = new Date(retryAfter);
       if (!isNaN(date.getTime())) {
         const diffMs = date.getTime() - Date.now();
@@ -67,56 +148,10 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    return null;
-  }
-
-  /**
-   * 计算第 attempt 次重试前的等待时间（毫秒）。
-   *
-   * 默认按递增序列：5s, 10s, 20s, 30s, 60s, 90s, 120s, ...（到达 30s 后
-   * 每次 +30s），避免指数退避让无意义的重试拖太长；若用户通过
-   * /429-retry <seconds> 显式设置了固定等待时间，则优先使用固定值。
-   */
-  function getRetryWaitMs(attempt: number): number {
-    if (customWaitMs !== null) {
-      return customWaitMs;
-    }
-    if (attempt <= RETRY_WAIT_SEQUENCE_SECONDS.length) {
-      return RETRY_WAIT_SEQUENCE_SECONDS[attempt - 1] * 1000;
-    }
-    const base = RETRY_WAIT_SEQUENCE_SECONDS[RETRY_WAIT_SEQUENCE_SECONDS.length - 1];
-    return (base + (attempt - RETRY_WAIT_SEQUENCE_SECONDS.length) * 30) * 1000;
-  }
-
-  /** 当前等待策略的人类可读描述（用于状态栏） */
-  function describeWaitStrategy(): string {
-    return customWaitMs !== null ? `${customWaitMs / 1000}s` : "5,10,20,30,60,90...+30s/次";
-  }
-
-  /**
-   * 检查响应是否为 request-logger 改写后的 429
-   * request-logger 将 429 改写为 400，body 包含 "Usage limit reached"
-   */
-  function isRewrittenRateLimit(response: Response): boolean {
-    // 检查是否为 400 状态码
-    if (response.status !== 400) return false;
-
-    // 检查 statusText 是否为 "Usage Limited"
-    if (response.statusText === "Usage Limited") return true;
-
-    return false;
-  }
-
-  /**
-   * 从改写后的响应中提取等待时间
-   */
-  async function extractWaitTimeFromRewrittenResponse(response: Response, attempt: number): Promise<number> {
+    // Fallback: extract "Resets in Xh Ym Zs" style reset time from the body
     try {
       const cloned = response.clone();
       const body = await cloned.text();
-
-      // 尝试从 body 中提取时间信息
-      // 格式: "Usage limit reached: Resets in Xh Ym Zs" 或类似
       const timeMatch = body.match(/Resets? in (\d+[hms](?:\s*\d+[hms])*)/i);
       if (timeMatch) {
         const timeStr = timeMatch[1];
@@ -133,43 +168,71 @@ export default function (pi: ExtensionAPI) {
         if (totalSeconds > 0) return totalSeconds * 1000;
       }
     } catch {
-      // 忽略解析错误
+      // Ignore body read/parse errors
     }
 
-    // 默认等待时间（按递增序列）
-    return getRetryWaitMs(attempt);
+    return null;
   }
 
   /**
-   * 检测"硬"用量限制（不可重试）——命中即快速失败，不进入重试循环。
+   * Compute the wait time (ms) before the `attempt`-th retry.
    *
-   * 判定依据（与 pi 上游 isTerminalRateLimitError 的错误分类一致）：
-   * 1. 响应 body 携带不可重试的用量限制错误标记。这些标记源自 opencode.ai
-   *    （Codex 兼容接口）的错误类型：FreeUsageLimitError（免费档）、
-   *    GoUsageLimitError（Go 档）等；insufficient_quota 亦是 OpenAI 的通用
-   *    quota 错误码。按 body 文本匹配，对任何 provider 生效（无 URL 门控）。
-   * 2. 重置窗口超过 HARD_LIMIT_WAIT_MS（10 分钟）——在合理重试窗口内不会恢复。
-   *
-   * 命中后：把原始响应交还上层 SDK，让它抛出错误并停止 agent（错误信息含
-   * 重置时间），而不是空转最多约 100 分钟（10 次 × 10 分钟）做无意义的重试。
+   * Default: incremental sequence 5s, 10s, 20s, 30s, 60s, 90s, 120s, ...
+   * (+30s per retry after 30s) so pointless retries do not drag on too long;
+   * if the user explicitly set a fixed wait via /429-retry <seconds>, that
+   * fixed value is used instead.
    */
-  async function isHardUsageLimit(response: Response, rawWaitMs: number): Promise<boolean> {
-    // 信号 1：响应 body 中含有明确的不可重试错误类型
+  function getRetryWaitMs(attempt: number): number {
+    if (customWaitMs !== null) {
+      return customWaitMs;
+    }
+    if (attempt <= RETRY_WAIT_SEQUENCE_SECONDS.length) {
+      return RETRY_WAIT_SEQUENCE_SECONDS[attempt - 1] * 1000;
+    }
+    const base = RETRY_WAIT_SEQUENCE_SECONDS[RETRY_WAIT_SEQUENCE_SECONDS.length - 1];
+    return (base + (attempt - RETRY_WAIT_SEQUENCE_SECONDS.length) * 30) * 1000;
+  }
+
+  /** Human-readable description of the current wait strategy (for the status bar) */
+  function describeWaitStrategy(): string {
+    return customWaitMs !== null ? `${customWaitMs / 1000}s` : "5,10,20,30,60,90...+30s each";
+  }
+
+  /**
+   * Find the ownership rule for a request URL (no match = undefined -> default retry).
+   */
+  function findRule(input: RequestInfo | URL): RateLimitRule | undefined {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    return RATE_LIMIT_RULES.find((r) => r.match(url));
+  }
+
+  /**
+   * Decide whether this 429 should be handed back (no retry):
+   * 1. Generic hard limit: server-requested wait exceeds HARD_LIMIT_WAIT_MS
+   *    (10 min) - pure HTTP semantics (Retry-After / body reset time), applies
+   *    to any request;
+   * 2. Ownership rule hit: the provider's isTerminal says permanent/hard limit.
+   *    On hit the original response is handed back and the provider handles it
+   *    (UI output belongs to the provider).
+   */
+  async function shouldReturnResponse(
+    response: Response,
+    rule: RateLimitRule | undefined,
+    rawWaitMs: number,
+  ): Promise<boolean> {
+    if (rawWaitMs > HARD_LIMIT_WAIT_MS) return true;
+    if (!rule) return false;
     try {
       const cloned = response.clone();
       const body = await cloned.text();
-      if (/FreeUsageLimitError|GoUsageLimitError|UsageLimitError|insufficient_quota|Monthly usage limit/i.test(body)) {
-        return true;
-      }
+      return rule.isTerminal(body);
     } catch {
-      // 忽略 body 读取失败
+      return false;
     }
-    // 信号 2：重置窗口超过上限——在合理重试窗口内不会恢复
-    return rawWaitMs > HARD_LIMIT_WAIT_MS;
   }
 
   /**
-   * 格式化时间为人类可读格式
+   * Format seconds into a human-readable string
    */
   function formatTime(seconds: number): string {
     if (seconds <= 0) return "now";
@@ -184,39 +247,78 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 创建带重试逻辑的 fetch 包装器
+   * Before handing the response back, inject the server-provided reset time
+   * into the body (resets_in field) so the SDK error can show "when it will
+   * recover". Only touches JSON bodies and only adds a field (never breaks
+   * content or changes the status code), so workbuddy's parseErrorJson etc.
+   * are unaffected.
+   */
+  async function annotateResetTime(response: Response, waitMs: number | null): Promise<Response> {
+    if (!waitMs || waitMs <= 0) return response;
+    try {
+      const cloned = response.clone();
+      const body = await cloned.text();
+      if (!body.trim().startsWith("{")) return response; // JSON bodies only
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      if (typeof parsed?.resets_in === "string") return response; // already present
+      const headers = new Headers(response.headers);
+      headers.delete("content-length"); // new body length differs; avoid header mismatch
+      return new Response(JSON.stringify({ ...parsed, resets_in: formatTime(Math.ceil(waitMs / 1000)) }), {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    } catch {
+      return response;
+    }
+  }
+
+  /**
+   * Create the fetch wrapper with retry logic
    */
   async function fetchWithRetry(
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> {
-    // 如果功能未启用，直接调用当前 fetch
+    // If disabled, call the current fetch directly
     if (!enabled) {
       return currentFetch.call(globalThis, input, init);
     }
 
+    const signal = init?.signal ?? null;
     let attempts = 0;
     let response = await currentFetch.call(globalThis, input, init);
 
-    // 检查是否为 429 响应（原始或改写后的）
-    while ((response.status === 429 || isRewrittenRateLimit(response)) && attempts < MAX_RETRIES) {
-      // 解析服务器请求的等待时间（未封顶）；服务器未给出时按递增序列
-      const rawWaitMs = response.status === 429
-        ? (parseWaitTimeFromResponse(response) ?? getRetryWaitMs(attempts + 1))
-        : await extractWaitTimeFromRewrittenResponse(response, attempts + 1);
+    // 429s are retried uniformly at the fetch layer; request-logger no longer
+    // rewrites them, responses pass through untouched
+    while (response.status === 429 && attempts < MAX_RETRIES) {
+      // Parse the server-requested wait time (Retry-After header or body reset
+      // time, uncapped); fall back to the incremental sequence when absent
+      const serverWaitMs = await parseWaitTimeFromResponse(response);
+      const rawWaitMs = serverWaitMs ?? getRetryWaitMs(attempts + 1);
 
-      // 硬用量限制（判定见 isHardUsageLimit）：立即失败，把原始响应交还上层
-      // SDK，让它抛出错误并停止 agent（同时展示重置时间），而不是空转重试。
-      if (await isHardUsageLimit(response, rawWaitMs)) {
+      // Ownership check: generic hard limit (wait > 10min) first, then the URL
+      // rule; on hit the original response is handed back without retry - the
+      // provider handles it (workbuddy raises a purchase prompt, the SDK
+      // reports by error marker); UI output belongs to the provider, so no
+      // notify here
+      const rule = findRule(input);
+      if (await shouldReturnResponse(response, rule, rawWaitMs)) {
+        // Inject the server-provided reset time before handing back
+        // (Retry-After header / body "Resets in"), so the SDK error shows
+        // "when it will recover"
+        const annotated = await annotateResetTime(response, serverWaitMs);
         const theme = _ctx?.ui?.theme;
         if (theme) {
           _ctx?.ui?.setStatus?.(
             "429-retry",
-            theme.fg("dim", "Usage limit reached — surfacing error (no retry)")
+            theme.fg("dim", rule
+              ? `429 handled by ${rule.name} - surfacing error (no retry)`
+              : "Rate limit reset window too long (>10m) - surfacing error (no retry)")
           );
         }
         isRateLimited = false;
-        return response;
+        return annotated;
       }
 
       attempts++;
@@ -224,14 +326,29 @@ export default function (pi: ExtensionAPI) {
       lastRateLimitTime = Date.now();
       retryCount = attempts;
 
-      // 确保等待时间至少为 1 秒，并封顶防止过长等待
+      // Give a prominent notice before the first retry (setStatus alone is
+      // easy to miss)
+      if (attempts === 1) {
+        _ctx?.ui?.notify?.(
+          `Received 429 (Too Many Requests) - will auto retry ${MAX_RETRIES} times (wait sequence: ${describeWaitStrategy()}); disable with /429-retry off`,
+          "warning"
+        );
+      }
+
+      // Ensure the wait is at least 1 second and capped to avoid endless waits
       let actualWaitMs = Math.max(rawWaitMs, 1000);
       actualWaitMs = Math.min(actualWaitMs, HARD_LIMIT_WAIT_MS);
 
-      // 倒计时显示（原地更新同一行，不累积）
+      // Countdown display (updates the same status line in place, no
+      // accumulation); controlled by AbortSignal
       const theme = _ctx?.ui?.theme;
       const endTime = Date.now() + actualWaitMs;
       while (Date.now() < endTime) {
+        // Aborted (Esc / Ctrl+C): stop retrying immediately and hand the
+        // current response back to the SDK
+        if (signal?.aborted) {
+          return response;
+        }
         const remainingSec = Math.ceil((endTime - Date.now()) / 1000);
         if (remainingSec <= 0) break;
         if (theme) {
@@ -243,19 +360,19 @@ export default function (pi: ExtensionAPI) {
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
 
-      // 重试请求
+      // Retry the request
       response = await currentFetch.call(globalThis, input, init);
     }
 
-    // 如果之前被限流但现在恢复正常，静默清除状态
-    if (isRateLimited && response.status !== 429 && !isRewrittenRateLimit(response)) {
+    // If we were rate limited but now recovered, silently clear the state
+    if (isRateLimited && response.status !== 429) {
       isRateLimited = false;
       retryCount = 0;
       _ctx?.ui?.setStatus?.("429-retry", undefined);
     }
 
-    // 如果达到最大重试次数仍然 429
-    if ((response.status === 429 || isRewrittenRateLimit(response)) && attempts >= MAX_RETRIES) {
+    // If still 429 after the maximum retry count
+    if (response.status === 429 && attempts >= MAX_RETRIES) {
       const theme = _ctx?.ui?.theme;
       if (theme) {
         _ctx?.ui?.setStatus?.(
@@ -269,7 +386,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 启用 fetch 包装
+   * Enable the fetch wrapper
    */
   function enableWrapper() {
     Object.defineProperty(globalThis, "fetch", {
@@ -277,8 +394,8 @@ export default function (pi: ExtensionAPI) {
         return fetchWithRetry;
       },
       set(v) {
-        // 如果有人覆盖 fetch，更新我们的底层 fetch
-        // 这样 request-logger 可以正常工作
+        // If someone overrides fetch, update our underlying fetch
+        // so request-logger keeps working
         (currentFetch as any) = v;
       },
       configurable: true,
@@ -287,10 +404,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * 禁用 fetch 包装（恢复原始 fetch）
+   * Disable the fetch wrapper (restore the original fetch)
    */
   function disableWrapper() {
-    // 恢复原始的 fetch（可能包含 request-logger 的包装）
+    // Restore the original fetch (possibly request-logger's wrapper)
     Object.defineProperty(globalThis, "fetch", {
       get() {
         return currentFetch;
@@ -307,17 +424,17 @@ export default function (pi: ExtensionAPI) {
     _ctx?.ui?.setStatus?.("429-retry", undefined);
   }
 
-  // 初始化时启用包装
+  // Enable the wrapper on init
   enableWrapper();
 
-  // 注册 /429-retry 命令
+  // Register the /429-retry command
   pi.registerCommand("429-retry", {
     description: "Toggle 429 retry or set wait time (e.g. /429-retry 30)",
     handler: async (args, ctx) => {
       const theme = ctx.ui.theme;
       const arg = args?.trim().toLowerCase();
 
-      // 解析参数：数字表示设置等待时间
+      // Parse args: a number sets the wait time
       if (arg && /^\d+$/.test(arg)) {
         const seconds = parseInt(arg, 10);
         if (seconds > 0) {
@@ -333,7 +450,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // 解析参数：on/off/enable/disable
+      // Parse args: on/off/enable/disable
       if (arg === "on" || arg === "enable" || arg === "true") {
         enabled = true;
         enableWrapper();
@@ -343,7 +460,7 @@ export default function (pi: ExtensionAPI) {
         disableWrapper();
         ctx.ui.notify("429 retry disabled", "info");
       } else if (!arg) {
-        // 无参数：切换状态
+        // No args: toggle
         enabled = !enabled;
         if (enabled) {
           enableWrapper();
@@ -357,7 +474,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // 更新状态栏
+      // Update the status bar
       ctx.ui.setStatus(
         "429-retry",
         enabled
@@ -367,7 +484,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // session_start 时初始化上下文
+  // Initialize the context on session start
   pi.on("session_start", async (_event, ctx) => {
     _ctx = ctx;
     const theme = ctx.ui.theme;
@@ -376,7 +493,7 @@ export default function (pi: ExtensionAPI) {
       theme.fg("dim", `429 retry: ${enabled ? "ON" : "OFF"} (${describeWaitStrategy()})`)
     );
 
-    // 3秒后隐藏初始状态（如果没有被限流）
+    // Hide the initial status after 3 seconds (if not rate limited)
     setTimeout(() => {
       if (!isRateLimited) {
         ctx.ui.setStatus("429-retry", undefined);
@@ -384,16 +501,16 @@ export default function (pi: ExtensionAPI) {
     }, 3000);
   });
 
-  // 监听 provider 响应事件，用于额外日志记录
+  // Listen for provider response events for extra logging
   pi.on("after_provider_response", (event, ctx) => {
     _ctx = ctx;
     if (event.status === 429) {
-      // 记录 429 事件（实际重试由 fetch 包装器处理）
+      // Log the 429 event (actual retries are handled by the fetch wrapper)
       console.log(`[429-retry] Detected 429 response at ${new Date().toISOString()}`);
     }
   });
 
-  // 清理：session 关闭时恢复原始 fetch
+  // Cleanup: restore the original fetch on session shutdown
   pi.on("session_shutdown", async () => {
     disableWrapper();
   });

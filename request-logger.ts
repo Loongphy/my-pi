@@ -10,6 +10,29 @@ const CWD = process.cwd();
 const SESSION_DIR_NAME = `--${CWD.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 const REQUESTS_DIR = resolve(homedir(), ".pi", "agent", "requests");
 
+// --- Debug / stall monitoring ---
+//
+// REQUEST_LOG_DEBUG=1 (or PI_REQUEST_LOG_DEBUG=1) enables a full lifecycle
+// timeline in the log, prefixed with [DBG]:
+//   - fetch: TTFB, per-chunk stream timing (pause >= 2s logged), stream totals
+//   - abort / network-error details (name, code, aborted flag)
+//   - pi events: agent_start/end, turn_start/end, message_start/update/end
+//     (update throttled to 5s), tool_execution_start/end, input
+// This makes it possible to tell WHERE a "Working..." hang is stuck:
+//   - [WARN] request stalled ... waiting for response headers
+//     => fetch() itself never resolved (network / server never replied)
+//   - [WARN] request stalled ... streaming (N chunks, X so far)
+//     => headers arrived, but the response stream stopped pushing data
+//   - no in-flight request logged but TUI still shows Working...
+//     => the stall is inside pi itself (agent retry backoff sleep, compaction,
+//        a tool, or another extension) — check the [DBG] pi-event timeline
+//
+// REQUEST_LOG_STALL_S=<seconds> sets the no-progress threshold for [WARN]
+// stall lines (default 30, min 5). Stall monitoring is always on: it is cheap
+// and only fires while a provider request is in flight.
+const DEBUG = process.env.REQUEST_LOG_DEBUG === "1" || process.env.PI_REQUEST_LOG_DEBUG === "1";
+const STALL_WARN_S = Math.max(5, Number(process.env.REQUEST_LOG_STALL_S ?? 30) || 30);
+
 // Per-session log file (set on session_start)
 let currentLogFile = "";
 function getLogFile(): string {
@@ -17,9 +40,18 @@ function getLogFile(): string {
 }
 
 // ============================================================
-// 429 rate-limit workaround for opencode.ai
+// 429 handling for opencode.ai (historical)
 // See: https://github.com/earendil-works/pi/issues/3671
 // See: https://github.com/earendil-works/pi/issues/4666
+//
+// The original 429→400 rewrite bypassed the SDK's unbounded retry-after
+// sleep (the "Working..." hang). pi now calls the SDK with maxRetries: 0
+// so the hang is fixed upstream, and the rewrite has been removed: 429
+// responses are passed through untouched. Retries are unified in the
+// 429-retry plugin (fetch layer, 5s/10s/... up to 15 attempts), and
+// providers with their own 429 handling (workbuddy quota exhaustion,
+// opencode SDK error classification) receive the raw response.
+// We keep a compact log line for opencode.ai 429s (error type + reset time).
 // ============================================================
 
 /** Parse retry-after: integer seconds, HTTP-date, or retry-after-ms. */
@@ -233,6 +265,146 @@ function isAbortError(err: unknown): boolean {
 const pendingPayloads: { model: string }[] = [];
 
 // ============================================================
+// In-flight request tracking + stall warnings
+// ============================================================
+interface InflightEntry {
+  url: string;
+  model: string;
+  start: number;        // fetch() call time
+  headersAt: number;    // when response headers arrived (0 = not yet)
+  phase: "awaiting_response" | "streaming";
+  lastProgress: number; // last activity (headers arrived / chunk received)
+  chunks: number;
+  bytes: number;
+  lastWarnAt: number;
+}
+const inflight = new Map<number, InflightEntry>();
+let inflightSeq = 0;
+
+// --- 自动重试检测（429-retry 插件在 fetch 层重试同一 URL） ---
+let _lastProviderUrl: string | null = null;
+let _retryCount = 0;
+let _lastRetryAt = 0;
+
+/** Periodically warn about provider requests that make no progress. */
+function startStallMonitor(): void {
+  const intervalMs = Math.max(5, Math.min(30, Math.floor(STALL_WARN_S / 2))) * 1000;
+  const timer = setInterval(() => {
+    const now = Date.now();
+    for (const [seq, e] of inflight) {
+      const idle = (now - e.lastProgress) / 1000;
+      if (idle >= STALL_WARN_S && now - e.lastWarnAt >= STALL_WARN_S * 1000) {
+        e.lastWarnAt = now;
+        const total = ((now - e.start) / 1000).toFixed(1);
+        const phaseDesc = e.phase === "awaiting_response"
+          ? "waiting for response headers (fetch not resolved)"
+          : `streaming (${e.chunks} chunks, ${fmtBytes(e.bytes)} so far)`;
+        appendLog(
+          `[${new Date(now).toISOString()}] [WARN] request stalled: ${e.model} — ${e.url}` +
+          `\n│ ${phaseDesc}, no progress for ${Math.floor(idle)}s, total ${total}s` +
+          `\n│ last progress: ${e.phase === "awaiting_response" ? "request sent" : new Date(e.headersAt).toISOString()} (headers)` +
+          (_retryCount > 0 && now - _lastRetryAt < STALL_WARN_S * 1000 * 2
+            ? `\n│ NOTE: ${_retryCount} auto-retry(ies) of the same URL are in progress` +
+              ` (likely 429-retry plugin waiting between retries — NOT a stuck stream)`
+            : "") +
+          `\n└─`
+        );
+      }
+    }
+  }, intervalMs);
+  (timer as unknown as { unref?: () => void }).unref?.();
+}
+
+function dbgLog(line: string): void {
+  if (!DEBUG) return;
+  appendLog(`[${new Date().toISOString()}] [DBG] ${line}`);
+}
+
+let _lastMsgUpdateLog = 0;
+
+function textLength(content: unknown): number {
+  if (typeof content === "string") return content.length;
+  if (Array.isArray(content)) {
+    return content.reduce((sum: number, c: unknown) => {
+      if (typeof c === "string") return sum + c.length;
+      const t = (c as { text?: string })?.text;
+      return sum + (typeof t === "string" ? t.length : 0);
+    }, 0);
+  }
+  return 0;
+}
+
+/**
+ * Debug-only: wrap the response body stream to record chunk timing.
+ * A long gap between chunks means the server stopped pushing data.
+ *
+ * Uses a Proxy so only `response.body` property access is intercepted
+ * (streaming SDK paths). Methods like text()/json()/clone() are bound to
+ * the original response and keep working untouched. The underlying stream
+ * is only locked (getReader) on the first read of the wrapped stream, so
+ * non-streaming consumers never see a "Body has already been read" error.
+ * Falls back to the original response on any error.
+ */
+function wrapStreamForDebug(response: Response, seq: number): Response {
+  try {
+    if (!response.body) return response;
+    const entry = inflight.get(seq);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    let chunks = 0;
+    let bytes = 0;
+    // highWaterMark: 0 is critical: without it the stream spec calls pull()
+    // once right after construction (desiredSize > 0) even with NO reader,
+    // which would lock + drain the original response body and break the
+    // SDK's text()/json() paths ("Body is unusable: Body has already been read").
+    const wrapped = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const t0 = Date.now();
+        try {
+          reader ??= response.body!.getReader();
+          const { done, value } = await reader.read();
+          const now = Date.now();
+          if (done) {
+            if (entry) {
+              const total = ((now - entry.start) / 1000).toFixed(1);
+              dbgLog(`stream_done: ${chunks} chunks, ${fmtBytes(bytes)}, total ${total}s`);
+              inflight.delete(seq);
+            }
+            controller.close();
+            return;
+          }
+          chunks++;
+          bytes += value.byteLength;
+          if (entry) entry.lastProgress = now;
+          const gap = (now - t0) / 1000;
+          if (gap >= 2) {
+            // only log pauses >= 2s to keep the log readable
+            dbgLog(`stream_chunk #${chunks} +${fmtBytes(value.byteLength)} after ${gap.toFixed(1)}s pause`);
+          }
+          controller.enqueue(value);
+        } catch (err) {
+          dbgLog(`stream_error: ${err instanceof Error ? err.message : String(err)}`);
+          controller.error(err);
+        }
+      },
+      cancel(reason) {
+        reader?.cancel(reason).catch(() => {});
+      },
+    }, { highWaterMark: 0 });
+    return new Proxy(response, {
+      get(target, prop) {
+        if (prop === "body") return wrapped;
+        // Note: deliberately NO receiver — undici's getters (status, headers,
+        // ok, url, ...) access private fields and would throw "Cannot read
+        // private member #state" if invoked with the Proxy as `this`.
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+  } catch { /* keep original response */ }
+  return response;
+}
+
+// ============================================================
 // TUI notification for non-2xx provider errors
 // ============================================================
 let _tuiCtx: ExtensionContext | null = null;
@@ -311,7 +483,35 @@ if (typeof _underlyingFetch === "function") {
         const dedupKey = `${method} ${url} @ ${ts.slice(0, 19)}`;
         const isDuplicate = !markLogged(dedupKey);
 
+        const safeUrl = sanitizeUrl(url);
+        const fetchStartAt = Date.now();
+        const seq = ++inflightSeq;
+
+        // 自动重试检测：非 provider 请求但 URL 与最近一次 provider 请求相同，
+        // 说明是 429-retry 等插件在 fetch 层重试（SDK 感知不到，TUI 无提示）。
+        if (!isProviderReq && !isDuplicate && _lastProviderUrl && url === _lastProviderUrl) {
+          _retryCount++;
+          _lastRetryAt = Date.now();
+          appendLog(
+            `[${ts}] [WARN] auto-retry #${_retryCount}: ${method} ${safeUrl}` +
+            ` (same URL as last provider request — 429-retry plugin retrying; SDK is still waiting)`
+          );
+        }
+
         if (isProviderReq && !isDuplicate) {
+          _lastProviderUrl = url;
+          _retryCount = 0;
+          inflight.set(seq, {
+            url: safeUrl,
+            model: payload?.model ?? "?",
+            start: fetchStartAt,
+            headersAt: 0,
+            phase: "awaiting_response",
+            lastProgress: fetchStartAt,
+            chunks: 0,
+            bytes: 0,
+            lastWarnAt: 0,
+          });
           const headerLines = Object.entries(headers)
             .map(([k, v]) => `    ${k.padEnd(24)} ${v}`)
             .join("\n");
@@ -387,7 +587,6 @@ if (typeof _underlyingFetch === "function") {
             bodySection = `│ body:\n    body_size                ${fmtBytes(bodySize)}`;
           }
 
-          const safeUrl = sanitizeUrl(url);
           const block = [
             `[${ts}] REQUEST ${method} ${safeUrl}`,
             `│ header:`,
@@ -397,12 +596,28 @@ if (typeof _underlyingFetch === "function") {
           ].filter(Boolean).join("\n");
 
           appendLog(block);
+          dbgLog(`fetch_start: ${method} ${safeUrl} model=${payload?.model ?? "?"} body=${bodySize ? fmtBytes(bodySize) : "none"}`);
         }
 
         try {
           let response = await _underlyingFetch.call(globalThis, input, init);
 
-          // Log original 429 before rewriting (so logs show real status)
+          const headersAt = Date.now();
+          const ttfbStr = ((headersAt - fetchStartAt) / 1000).toFixed(2);
+          if (isProviderReq && !isDuplicate) {
+            const entry = inflight.get(seq);
+            if (entry) {
+              entry.headersAt = headersAt;
+              entry.lastProgress = headersAt;
+              entry.phase = "streaming";
+              // Non-debug: only monitor the "no headers yet" phase — without
+              // chunk tracking a long but healthy stream would false-positive.
+              if (!DEBUG) inflight.delete(seq);
+            }
+            dbgLog(`response_headers: status=${response.status} ttfb=${ttfbStr}s`);
+          }
+
+          // Log original 429 (opencode.ai) — response is passed through untouched
           const isRateLimited = response.status === 429 && url.includes("opencode.ai");
           if (isRateLimited) {
             const seconds = parseRetryAfter(
@@ -412,10 +627,9 @@ if (typeof _underlyingFetch === "function") {
             const limitMs = seconds != null && seconds > 0 ? seconds * 1000 : 60_000;
             const timeStr = formatTime(Math.ceil(limitMs / 1000));
 
-            // Preserve the provider's error type (e.g. FreeUsageLimitError / GoUsageLimitError).
-            // The SDK matches this marker to classify the error as a non-retryable limit,
-            // so it stops the agent immediately instead of retrying.
-            let errType = "FreeUsageLimitError";
+            // Extract the provider's error type (e.g. FreeUsageLimitError / GoUsageLimitError)
+            // for the log summary. The SDK classifies these markers as non-retryable limits.
+            let errType = "unknown";
             try {
               const cloned = response.clone();
               const txt = await cloned.text();
@@ -430,26 +644,14 @@ if (typeof _underlyingFetch === "function") {
                 .map(([k, v]) => `    ${k.padEnd(24)} ${v}`)
                 .join("\n");
               appendLog(
-                `[${ts}] RESPONSE 429 (${errType}, resets in ${timeStr}; rewritten to 400)` +
+                `[${ts}] RESPONSE 429 ttfb ${ttfbStr}s (${errType}, resets in ${timeStr}; passed through — 429-retry plugin handles retries)` +
                 `\n│ header:\n${rhLines}\n└─`
               );
             }
-
-            // 429 → 400 rewrite: originally used to bypass the SDK's unbounded
-            // retry-after sleep on 429 (pi#3671/pi#4666). pi now calls the SDK with
-            // maxRetries: 0, so the hang is fixed upstream. The rewrite is kept for
-            // formatting: it carries the retry-after reset time into the error message.
-            const body = `Usage limit reached (${errType}): Resets in ${timeStr}`;
-            _lastErrorBody = body;
-            response = new Response(body, {
-              status: 400,
-              statusText: "Usage Limited",
-              headers: { "content-type": "text/plain" },
-            });
           }
 
-          // Skip logging rewritten 400 (already logged original 429 above)
-          if (isProviderReq && !isDuplicate && !isRateLimited) {
+          // Log all provider responses (429 included — body cached for TUI notification)
+          if (isProviderReq && !isDuplicate) {
             const respHeaders: Record<string, string> = {};
             response.headers.forEach((v, k) => { respHeaders[k] = v; });
 
@@ -490,11 +692,17 @@ if (typeof _underlyingFetch === "function") {
             }
 
             appendLog(
-              `[${ts}] RESPONSE ${response.status}` +
+              `[${ts}] RESPONSE ${response.status} (ttfb ${ttfbStr}s)` +
               `\n│ header:\n${rhLines}` +
               bodySection +
               `\n└─`
             );
+          }
+
+          // Debug-only: wrap the stream to record chunk timing for in-flight
+          // requests. Non-debug responses pass through untouched.
+          if (DEBUG && isProviderReq && !isDuplicate) {
+            response = wrapStreamForDebug(response, seq);
           }
 
           return response;
@@ -502,13 +710,21 @@ if (typeof _underlyingFetch === "function") {
           if (isProviderReq && !isDuplicate) {
             // Include the root cause (err.cause chain) instead of the generic
             // "fetch failed"/"Connection error." wrapper messages.
+            const elapsed = ((Date.now() - fetchStartAt) / 1000).toFixed(1);
             const errMsg = describeNetworkError(err);
-            appendLog(`[${ts}] FETCH ERROR: ${sanitizeError(errMsg)}`);
+            appendLog(`[${ts}] FETCH ERROR after ${elapsed}s: ${sanitizeError(errMsg)}`);
+            inflight.delete(seq);
+            const aborted = isAbortError(err);
+            if (DEBUG) {
+              const e = err as { name?: string; code?: string };
+              dbgLog(`fetch_error: name=${e?.name ?? ""} code=${e?.code ?? ""} aborted=${aborted} elapsed=${elapsed}s`);
+              if (aborted) dbgLog("fetch aborted by user (AbortError / Esc / Ctrl+C)");
+            }
             // Skip TUI notification for user-initiated aborts (Esc/Ctrl+C).
             // The error is still written to the log file for diagnostics.
-            if (!isAbortError(err)) {
+            if (!aborted) {
               const detail = rootCauseDetail(err);
-              _tuiCtx?.ui.notify(`🌐 Network error: ${sanitizeError(errMsg)}`, "error");
+              _tuiCtx?.ui.notify(sanitizeError(errMsg), "error");
             }
           }
           throw err;
@@ -532,6 +748,9 @@ export default function (pi: ExtensionAPI): void {
     if (!existsSync(REQUESTS_DIR)) mkdirSync(REQUESTS_DIR, { recursive: true });
   } catch { /* ignore */ }
 
+  // Warn about provider requests that make no progress (always on, cheap)
+  startStallMonitor();
+
   // Track ctx for TUI notifications
   pi.on("before_provider_request", (event, ctx) => {
     _tuiCtx = ctx;
@@ -542,12 +761,14 @@ export default function (pi: ExtensionAPI): void {
       if (body?.model) model = String(body.model);
     } catch { /* ignore */ }
     pendingPayloads.push({ model: model || "?" });
+    dbgLog(`provider_request queued: model=${model || "?"} pending=${pendingPayloads.length}`);
   });
 
   // after_provider_response: show TUI notification for non-2xx provider HTTP responses
   // Fires after HTTP response received, before stream consumed — body already cached by fetch interceptor
   pi.on("after_provider_response", (event, ctx) => {
     _tuiCtx = ctx;
+    dbgLog(`after_provider_response: status=${event.status} (handler fired)`);
 
     if (event.status < 200 || event.status >= 300) {
       const body = _lastErrorBody;
@@ -575,7 +796,48 @@ export default function (pi: ExtensionAPI): void {
     currentLogFile = join(sessionDir, `requests-${base}.log`);
 
     appendLog(`[${new Date().toISOString()}] SESSION START (session_id=${ctx.sessionManager.getSessionId()}, cwd=${CWD})`);
+    if (DEBUG) {
+      appendLog(`[${new Date().toISOString()}] [DBG] request-logger debug mode ON (REQUEST_LOG_DEBUG=1)`);
+      appendLog(`[${new Date().toISOString()}] [DBG] stall warning threshold: ${STALL_WARN_S}s (REQUEST_LOG_STALL_S)`);
+    }
   });
+
+  // --- Debug-only: pi lifecycle timeline -------------------------
+  // Helps distinguish "stuck waiting on the network" from "stuck inside pi"
+  // (retry backoff sleep, compaction, tool execution, another extension).
+  if (DEBUG) {
+    pi.on("input", (event) => {
+      dbgLog(`input: "${(event.text ?? "").slice(0, 100)}" (source=${event.source})`);
+    });
+    pi.on("before_agent_start", (event) => {
+      dbgLog(`agent_start: prompt="${(event.prompt ?? "").slice(0, 100)}"`);
+    });
+    pi.on("agent_end", (event) => {
+      const last = event.messages[event.messages.length - 1];
+      dbgLog(`agent_end: last=${last?.role} stopReason=${last?.stopReason ?? ""} error=${last?.errorMessage ?? ""}`);
+    });
+    pi.on("agent_settled", () => dbgLog("agent_settled"));
+    pi.on("turn_start", (event) => dbgLog(`turn_start: #${event.turnIndex}`));
+    pi.on("turn_end", (event) => {
+      dbgLog(`turn_end: #${event.turnIndex} stopReason=${event.message.stopReason ?? ""} error=${event.message.errorMessage ?? ""}`);
+    });
+    pi.on("message_start", (event) => dbgLog(`message_start: role=${event.message.role}`));
+    pi.on("message_update", (event) => {
+      // Throttled to 5s so token-by-token streaming doesn't flood the log.
+      const now = Date.now();
+      if (now - _lastMsgUpdateLog >= 5000) {
+        _lastMsgUpdateLog = now;
+        const m = event.message;
+        dbgLog(`message_update: content=${textLength(m.content)} chars${m.usage ? ` usage=${JSON.stringify(m.usage)}` : ""}`);
+      }
+    });
+    pi.on("message_end", (event) => {
+      const m = event.message;
+      dbgLog(`message_end: role=${m.role} stopReason=${m.stopReason ?? ""} error=${m.errorMessage ?? ""}`);
+    });
+    pi.on("tool_execution_start", (event) => dbgLog(`tool_start: ${event.toolName}`));
+    pi.on("tool_execution_end", (event) => dbgLog(`tool_end: ${event.toolName} isError=${event.isError}`));
+  }
 
   // Log model switches
   pi.on("model_select", (event, ctx) => {

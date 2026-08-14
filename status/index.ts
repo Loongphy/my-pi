@@ -240,7 +240,12 @@ function buildTitlePrompt(entries: SessionEntry[]): string {
   }
   if (lines.length === 0) return "";
   return [
-    "Generate a very short, concise title (\u22645 words, no quotes) for this conversation:",
+    "Generate a concise title for this conversation. It will be shown in a session list, so it must identify the conversation at a glance.",
+    "",
+    "Rules:",
+    "- Choose the length to fit the content: 3\u20138 characters for simple, single-purpose conversations; longer (up to 60 characters) for complex, multi-step, or ongoing work. Let the content decide \u2014 do not force brevity when the topic is broad.",
+    "- Use a noun phrase rather than a full sentence; no quotes, no \"Title:\" prefix, no trailing punctuation.",
+    "- Output only the title text, nothing else.",
     "",
     "<conversation>",
     lines.join("\n\n"),
@@ -266,12 +271,12 @@ async function autoGenerateTitle(pi: ExtensionAPI, ctx: ExtensionContext, state:
       messages: [
         { role: "user" as const, content: [{ type: "text" as const, text: prompt }], timestamp: Date.now() },
       ],
-    }, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: 30 });
+    }, { apiKey: auth.apiKey, headers: auth.headers, maxTokens: 128 });
     const title = response.content
       .filter((c): c is { type: "text"; text: string } => c.type === "text")
       .map((c) => c.text.trim()).join("")
       .replace(/^["']|["']$/g, "").trim();
-    if (title && title.length > 0 && title.length <= 80) {
+    if (title && title.length > 0 && title.length <= 60) {
       pi.setSessionName(title);
       if (!state.isWorking) ctx.ui.setTitle(buildIdleTitle(pi));
     }
@@ -306,7 +311,7 @@ function createWidgetFactory(
         const statusLines = buildStatusHeader(pi, ctx, {
           gitStatus: state.gitStatus,
           tokenSpeedEngine: state.tokenSpeedEngine,
-        }, config, theme);
+        }, config, theme, width);
         for (const l of statusLines) {
           lines.push(truncateToWidth(l, width, theme.fg("dim", "...")));
         }
