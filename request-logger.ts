@@ -87,6 +87,23 @@ function formatTime(seconds: number): string {
   return parts.join(" ");
 }
 
+/**
+ * Codex-style reset timestamp, port of the codex TUI's
+ * format_reset_timestamp (tui/src/status/helpers.rs): same-day resets render
+ * as "14:30", resets on a later day as "14:30 5 Mar". Local time,
+ * zero-padded HH:MM, unpadded day-of-month, English month. Kept in sync
+ * with 429-retry.ts's formatResetAt.
+ */
+const RESET_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function formatResetAt(resetAt: Date, now: Date = new Date()): string {
+  const time = `${String(resetAt.getHours()).padStart(2, "0")}:${String(resetAt.getMinutes()).padStart(2, "0")}`;
+  const sameDay =
+    resetAt.getFullYear() === now.getFullYear() &&
+    resetAt.getMonth() === now.getMonth() &&
+    resetAt.getDate() === now.getDate();
+  return sameDay ? time : `${time} ${resetAt.getDate()} ${RESET_MONTHS[resetAt.getMonth()]}`;
+}
+
 // ============================================================
 // Helpers
 // ============================================================
@@ -626,6 +643,11 @@ if (typeof _underlyingFetch === "function") {
             );
             const limitMs = seconds != null && seconds > 0 ? seconds * 1000 : 60_000;
             const timeStr = formatTime(Math.ceil(limitMs / 1000));
+            // codex-style wall clock: "resets at 14:30 (in 8h 7m 17s)"
+            const resetNote =
+              seconds != null && seconds > 0
+                ? `resets at ${formatResetAt(new Date(Date.now() + seconds * 1000))} (in ${timeStr})`
+                : `resets in ${timeStr}`;
 
             // Extract the provider's error type (e.g. FreeUsageLimitError / GoUsageLimitError)
             // for the log summary. The SDK classifies these markers as non-retryable limits.
@@ -644,7 +666,7 @@ if (typeof _underlyingFetch === "function") {
                 .map(([k, v]) => `    ${k.padEnd(24)} ${v}`)
                 .join("\n");
               appendLog(
-                `[${ts}] RESPONSE 429 ttfb ${ttfbStr}s (${errType}, resets in ${timeStr}; passed through — 429-retry plugin handles retries)` +
+                `[${ts}] RESPONSE 429 ttfb ${ttfbStr}s (${errType}, ${resetNote}; passed through — 429-retry plugin handles retries)` +
                 `\n│ header:\n${rhLines}\n└─`
               );
             }

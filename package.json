@@ -13,7 +13,8 @@
 		"shortcuts.ts",
 		"429-retry.ts",
 		"status/",
-		"thinking-level-memory.ts"
+		"thinking-level-memory.ts",
+		"deepseek-v4-router.ts"
 	],
 	"pi": {
 		"extensions": [
@@ -22,7 +23,8 @@
 			"./shortcuts.ts",
 			"./429-retry.ts",
 			"./status/",
-			"./thinking-level-memory.ts"
+			"./thinking-level-memory.ts",
+			"./deepseek-v4-router.ts"
 		]
 	}
 }

@@ -22,6 +22,20 @@
  *   unowned/unmatched 429s are always retried by default. UI output belongs
  *   to the provider; this plugin never oversteps.
  *
+ * Reset-time annotation (codex-style "resets at HH:MM", opencode-only):
+ * - before a terminal opencode.ai 429 is handed back, annotateResetTime()
+ *   injects the server-provided reset time into the JSON body (Retry-After
+ *   header / body "Resets in" text): resets_at ("14:30" / "14:30 5 Mar",
+ *   same format as the codex TUI's format_reset_timestamp) plus the
+ *   remaining duration resets_in. The fields are added both at the top
+ *   level and inside body.error, and a " (Free usage limit resets at
+ *   14:30)" suffix is appended to error.message, so whichever shape the
+ *   provider SDK surfaces (openai error.error JSON dump, anthropic
+ *   error.message) carries the info into the final error the TUI displays.
+ * - non-opencode terminal 429s (workbuddy quota, generic >10min hard
+ *   limit) keep the historical top-level resets_in only; those providers
+ *   have their own error UX and do not need the codex annotation.
+ *
  * NOTE: this file is intentionally pure ASCII. Older versions mixed in
  * non-ASCII characters (CJK comments, em dashes) that show up as mojibake in
  * some terminals/editors. The Chinese literals below are kept ONLY inside the
@@ -116,8 +130,19 @@ export default function (pi: ExtensionAPI) {
   let customWaitMs: number | null = null;
   let _ctx: ExtensionContext | null = null;
 
-  // Keep a reference to the current fetch (possibly request-logger's wrapper)
-  const currentFetch = globalThis.fetch;
+  // Ghost re-issue suppression. After the user aborts (Esc/Ctrl+C), the SDK
+  // (or pi's own session-level retry) may re-issue the SAME request with a
+  // FRESH non-aborted signal. Retrying that request starts a brand-new retry
+  // sequence (warnings restart at 1/15) that keeps hammering the API after the
+  // user already stopped. Requests to the same URL within this window are
+  // forwarded ONCE without retry, so the ghost dies silently.
+  let lastAbortAt: number | null = null;
+  let lastAbortUrl: string | null = null;
+  const GHOST_REISSUE_WINDOW_MS = 30_000;
+
+  // Keep a reference to the current fetch (possibly request-logger's wrapper).
+  // `let`: the setter below re-assigns it when someone overrides globalThis.fetch.
+  let currentFetch = globalThis.fetch;
 
   /**
    * Parse the wait time (ms) requested by the response.
@@ -202,8 +227,7 @@ export default function (pi: ExtensionAPI) {
    * Find the ownership rule for a request URL (no match = undefined -> default retry).
    */
   function findRule(input: RequestInfo | URL): RateLimitRule | undefined {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-    return RATE_LIMIT_RULES.find((r) => r.match(url));
+    return RATE_LIMIT_RULES.find((r) => r.match(urlOf(input)));
   }
 
   /**
@@ -232,6 +256,62 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
+   * Build an AbortError to surface to the SDK when the user aborts
+   * (Esc / Ctrl+C) during a retry wait. Prefers the signal's own reason so
+   * the abort stays attributable, falling back to a standard DOMException.
+   */
+  function abortError(signal: AbortSignal | null): Error {
+    const reason = signal?.reason;
+    if (reason instanceof Error) return reason;
+    return new DOMException("The operation was aborted.", "AbortError");
+  }
+
+  /**
+   * Single live countdown line in the CHAT area (the position the old
+   * per-retry warnings used). Consecutive "info" notifies update the SAME
+   * line in place (pi's showStatus mechanism), so we get one changing line
+   * instead of one line per retry. The "Warning: " prefix keeps it looking
+   * like the original warning; the color is dim because warning-type
+   * notifications always append a new line and cannot be updated in place.
+   */
+  function setRateLimitLine(remainingSec: number, attempt: number): void {
+    _ctx?.ui?.notify?.(
+      `Warning: Received 429 (Too Many Requests) - retry ${attempt}/${MAX_RETRIES} in ${remainingSec}s; disable with /429-retry off`,
+      "info"
+    );
+  }
+
+  /**
+   * Clear the "rate limited" state so the status bar does not linger after
+   * the user aborted a retry wait.
+   */
+  function clearRateLimitState(): void {
+    isRateLimited = false;
+    retryCount = 0;
+    lastRateLimitTime = null;
+    _ctx?.ui?.setStatus?.("429-retry", undefined);
+  }
+
+  /**
+   * Abort handling for the retry loop: reject with a real AbortError instead
+   * of resolving with the 429 response. Returning the 429 response makes the
+   * SDK treat the request as completed-with-a-retryable-error, so it re-issues
+   * the request and the user sees a SECOND 429 warning after Esc/Ctrl+C.
+   * Also records the abort so ghost re-issues of the same URL are not retried.
+   */
+  function abortRetry(signal: AbortSignal | null, url: string): never {
+    lastAbortAt = Date.now();
+    lastAbortUrl = url;
+    clearRateLimitState();
+    throw abortError(signal);
+  }
+
+  /** Normalize a RequestInfo/URL into its string href. */
+  function urlOf(input: RequestInfo | URL): string {
+    return typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  }
+
+  /**
    * Format seconds into a human-readable string
    */
   function formatTime(seconds: number): string {
@@ -247,23 +327,111 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * Before handing the response back, inject the server-provided reset time
-   * into the body (resets_in field) so the SDK error can show "when it will
-   * recover". Only touches JSON bodies and only adds a field (never breaks
-   * content or changes the status code), so workbuddy's parseErrorJson etc.
-   * are unaffected.
+   * Codex-style reset timestamp, port of the codex TUI's
+   * format_reset_timestamp (tui/src/status/helpers.rs): same-day resets
+   * render as "14:30", resets on a later day as "14:30 5 Mar".
+   * Local time, zero-padded HH:MM, unpadded day-of-month, English month.
    */
-  async function annotateResetTime(response: Response, waitMs: number | null): Promise<Response> {
+  const RESET_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  function formatResetAt(resetAt: Date, now: Date = new Date()): string {
+    const time = `${String(resetAt.getHours()).padStart(2, "0")}:${String(resetAt.getMinutes()).padStart(2, "0")}`;
+    const sameDay =
+      resetAt.getFullYear() === now.getFullYear() &&
+      resetAt.getMonth() === now.getMonth() &&
+      resetAt.getDate() === now.getDate();
+    return sameDay ? time : `${time} ${resetAt.getDate()} ${RESET_MONTHS[resetAt.getMonth()]}`;
+  }
+
+  /**
+   * Extract a human-readable limit label from a 429 body, mirroring
+   * opencode-src's GoUsageLimitError handling (metadata.limitName) plus the
+   * zen error-type markers. Returns undefined when the body carries no
+   * recognizable usage-limit marker (generic 429s stay unlabeled).
+   */
+  function extractLimitLabel(body: string): string | undefined {
+    try {
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      const err = (parsed?.error ?? parsed) as Record<string, unknown>;
+      const errType = typeof err?.type === "string" ? err.type : "";
+      if (errType.includes("FreeUsageLimitError")) return "Free usage";
+      if (errType.includes("GoUsageLimitError")) return "Go usage";
+      const metadata = (err?.metadata ?? {}) as Record<string, unknown>;
+      if (typeof metadata?.limitName === "string" && metadata.limitName.trim()) {
+        return metadata.limitName.trim();
+      }
+    } catch {
+      /* not JSON */
+    }
+    return undefined;
+  }
+
+  /**
+   * Inject the server-provided reset time into a terminal 429 body before it
+   * is handed back to the SDK.
+   *
+   * Two modes:
+   * - opencode=true (opencode.ai usage-limit 429s, opencode rule hit): the
+   *   full codex-style annotation - resets_at ("14:30" / "14:30 5 Mar",
+   *   port of the codex TUI's format_reset_timestamp) and resets_in, added
+   *   both top-level and inside body.error, plus a
+   *   " (Free usage limit resets at 14:30)" suffix appended to
+   *   error.message. Whichever shape the SDK surfaces (openai's error.error
+   *   JSON dump, anthropic's error.message) then carries the reset time
+   *   into the final error message the TUI displays.
+   * - opencode=false (workbuddy quota, generic >10min hard limit): keep the
+   *   historical behavior, top-level resets_in only - those providers have
+   *   their own error UX (purchase prompt etc.) and do not need the suffix.
+   *
+   * Only touches JSON bodies, only adds fields / appends a suffix (never
+   * breaks content or changes the status code), so workbuddy's parseErrorJson
+   * and pi's terminal-limit classification are unaffected.
+   */
+  async function annotateResetTime(
+    response: Response,
+    waitMs: number | null,
+    opencode: boolean,
+  ): Promise<Response> {
     if (!waitMs || waitMs <= 0) return response;
     try {
       const cloned = response.clone();
       const body = await cloned.text();
-      if (!body.trim().startsWith("{")) return response; // JSON bodies only
+      if (!body.trim().startsWith("{")) return response; // JSON objects only
       const parsed = JSON.parse(body) as Record<string, unknown>;
       if (typeof parsed?.resets_in === "string") return response; // already present
       const headers = new Headers(response.headers);
       headers.delete("content-length"); // new body length differs; avoid header mismatch
-      return new Response(JSON.stringify({ ...parsed, resets_in: formatTime(Math.ceil(waitMs / 1000)) }), {
+
+      const durationStr = formatTime(Math.ceil(waitMs / 1000));
+      if (!opencode) {
+        // historical generic behavior: top-level resets_in only
+        return new Response(JSON.stringify({ ...parsed, resets_in: durationStr }), {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      }
+
+      // opencode-only codex-style annotation
+      const resetAtStr = formatResetAt(new Date(Date.now() + waitMs));
+      const label = extractLimitLabel(body);
+
+      const annotated: Record<string, unknown> = {
+        ...parsed,
+        resets_at: resetAtStr,
+        resets_in: durationStr,
+      };
+      const err = (parsed?.error ?? null) as Record<string, unknown> | null;
+      if (err && typeof err === "object" && !Array.isArray(err) && typeof err.message === "string") {
+        const note = label ? `${label} limit resets at ${resetAtStr}` : `resets at ${resetAtStr}`;
+        annotated.error = {
+          ...err,
+          message: `${err.message} (${note})`,
+          resets_at: resetAtStr,
+          resets_in: durationStr,
+        };
+      }
+
+      return new Response(JSON.stringify(annotated), {
         status: response.status,
         statusText: response.statusText,
         headers,
@@ -286,6 +454,15 @@ export default function (pi: ExtensionAPI) {
     }
 
     const signal = init?.signal ?? null;
+    const url = urlOf(input);
+
+    // Ghost re-issue right after a user abort (Esc/Ctrl+C): the SDK re-issues
+    // the same request with a fresh signal. Forward it ONCE without retrying so
+    // the retry countdown does not restart at 1/15 after the user stopped.
+    if (lastAbortAt !== null && url === lastAbortUrl && Date.now() - lastAbortAt < GHOST_REISSUE_WINDOW_MS) {
+      return currentFetch.call(globalThis, input, init);
+    }
+
     let attempts = 0;
     let response = await currentFetch.call(globalThis, input, init);
 
@@ -306,8 +483,10 @@ export default function (pi: ExtensionAPI) {
       if (await shouldReturnResponse(response, rule, rawWaitMs)) {
         // Inject the server-provided reset time before handing back
         // (Retry-After header / body "Resets in"), so the SDK error shows
-        // "when it will recover"
-        const annotated = await annotateResetTime(response, serverWaitMs);
+        // "when it will recover". The full codex-style annotation
+        // (resets_at + error.message suffix) is opencode-only; other
+        // providers keep the historical top-level resets_in.
+        const annotated = await annotateResetTime(response, serverWaitMs, rule?.name === "opencode");
         const theme = _ctx?.ui?.theme;
         if (theme) {
           _ctx?.ui?.setStatus?.(
@@ -318,7 +497,19 @@ export default function (pi: ExtensionAPI) {
           );
         }
         isRateLimited = false;
+        // If the user aborted while we were annotating / deciding ownership,
+        // reject with a real AbortError instead of handing the 429 back.
+        if (signal?.aborted) {
+          abortRetry(signal, url);
+        }
         return annotated;
+      }
+
+      // If the user aborted while we were deciding what to do, reject with a
+      // real AbortError so the SDK sees a clean abort (and does not re-issue
+      // the request, which would print a duplicate 429 warning).
+      if (signal?.aborted) {
+        abortRetry(signal, url);
       }
 
       attempts++;
@@ -326,38 +517,32 @@ export default function (pi: ExtensionAPI) {
       lastRateLimitTime = Date.now();
       retryCount = attempts;
 
-      // Give a prominent notice before the first retry (setStatus alone is
-      // easy to miss)
-      if (attempts === 1) {
-        _ctx?.ui?.notify?.(
-          `Received 429 (Too Many Requests) - will auto retry ${MAX_RETRIES} times (wait sequence: ${describeWaitStrategy()}); disable with /429-retry off`,
-          "warning"
-        );
-      }
-
       // Ensure the wait is at least 1 second and capped to avoid endless waits
       let actualWaitMs = Math.max(rawWaitMs, 1000);
       actualWaitMs = Math.min(actualWaitMs, HARD_LIMIT_WAIT_MS);
 
-      // Countdown display (updates the same status line in place, no
-      // accumulation); controlled by AbortSignal
-      const theme = _ctx?.ui?.theme;
+      // Single live countdown line in the chat area: shows the concrete wait
+      // for THIS attempt and counts it down in place every second - no
+      // per-retry warning lines.
+      setRateLimitLine(Math.ceil(actualWaitMs / 1000), attempts);
+
       const endTime = Date.now() + actualWaitMs;
       while (Date.now() < endTime) {
-        // Aborted (Esc / Ctrl+C): stop retrying immediately and hand the
-        // current response back to the SDK
-        if (signal?.aborted) {
-          return response;
-        }
         const remainingSec = Math.ceil((endTime - Date.now()) / 1000);
         if (remainingSec <= 0) break;
-        if (theme) {
-          _ctx?.ui?.setStatus?.(
-            "429-retry",
-            theme.fg("dim", `Rate limited (429). Waiting ${remainingSec}s before retry ${attempts}/${MAX_RETRIES}...`)
-          );
+        setRateLimitLine(remainingSec, attempts);
+        // Aborted (Esc / Ctrl+C): stop retrying immediately and surface a
+        // real abort to the SDK (reject, do NOT resolve with the 429 response).
+        if (signal?.aborted) {
+          abortRetry(signal, url);
         }
         await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+
+      // Final abort check right before re-issuing: if the abort landed during
+      // the last second of the countdown, do not retry.
+      if (signal?.aborted) {
+        abortRetry(signal, url);
       }
 
       // Retry the request
@@ -421,6 +606,8 @@ export default function (pi: ExtensionAPI) {
 
     isRateLimited = false;
     retryCount = 0;
+    lastAbortAt = null;
+    lastAbortUrl = null;
     _ctx?.ui?.setStatus?.("429-retry", undefined);
   }
 
