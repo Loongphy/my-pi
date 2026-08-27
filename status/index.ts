@@ -3,6 +3,7 @@
  *
  * Orchestrates all sub-modules:
  *   - Animated terminal title + working indicator
+ *     (includes a ⏎N badge for queued steer/followUp messages)
  *   - Real-time "Working for" message
  *   - Turn duration display
  *   - Auto conversation title generation
@@ -56,6 +57,18 @@ interface AppState {
   workingMessageTimer: ReturnType<typeof setInterval> | null;
   agentStartMs: number | null;
 
+  // Queued messages (steer / followUp) — remaining count shown in the title
+  pendingCount: number;
+
+  // Focus / unread marker (title ◉ prefix)
+  focusSupported: boolean;
+  focused: boolean;
+  unread: boolean;
+  /** Latest usable ctx for title refreshes from raw-input callbacks (which get no ctx). */
+  uiCtx: ExtensionContext | null;
+  /** Unsubscribe for the focus-event input listener (re-registered per session). */
+  terminalInputUnsub: (() => void) | null;
+
   // Auto-title
   isAutoTitling: boolean;
 
@@ -91,6 +104,12 @@ function createInitialState(): AppState {
     isRetrying: false,
     workingMessageTimer: null,
     agentStartMs: null,
+    pendingCount: 0,
+    focusSupported: false,
+    focused: true, // optimistic default: user is looking
+    unread: false,
+    uiCtx: null,
+    terminalInputUnsub: null,
     isAutoTitling: false,
     gitStatus: null,
     lastAgentDuration: null,
@@ -126,6 +145,92 @@ function formatDuration(ms: number, prefix: string): string {
   const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
   return `${prefix} ${[h > 0 && `${h}h`, m > 0 && `${m}m`, `${s}s`].filter(Boolean).join(" ")}`;
+}
+
+// ── Queued message count reconciliation ──
+//
+// pi's extension API only exposes ctx.hasPendingMessages() (boolean) — there
+// is no queue count. We maintain pendingCount by event accounting:
+//   +1  pi.on("input") with streamingBehavior set. prompt() emits the input
+//       event right before queueing, and streamingBehavior is only non-empty
+//       when isStreaming, in which case the message *always* gets queued. So
+//       +1 is exact.
+//   -1  pi.on("message_start") for user messages. Queue consumption splices
+//       the message BEFORE broadcasting to extensions, so hasPendingMessages()
+//       in the handler reflects the post-consumption state: queue empty →
+//       reset to 0; queue non-empty → exactly one was consumed, decrement.
+//   ≈   The 100ms working tick reconciles against the boolean to also cover
+//       a pre-existing non-empty queue when the extension is hot-reloaded.
+
+function reconcilePendingCount(ctx: ExtensionContext, state: AppState): void {
+  let pending = false;
+  try { pending = ctx.hasPendingMessages(); } catch { return; }
+  if (pending) {
+    if (state.pendingCount <= 0) state.pendingCount = 1;
+  } else {
+    state.pendingCount = 0;
+  }
+}
+
+// ── Focus / unread marker (title ◉ prefix) ──
+//
+// The TUI enables xterm focus reporting (CSI ? 1004 h) on the alt screen, so
+// terminals that support it push "\x1b[I" (focus in) / "\x1b[O" (focus out)
+// to us. Extensions receive those via ctx.ui.onTerminalInput() — raw bytes,
+// before any TUI consumption. On that basis we light a plain ◉ when the user
+// walked away and something notable happened, and clear it the moment they
+// come back:
+//   focusSupported — set on the first focus event received; until then the
+//                    dot never renders (unsupported terminal / tmux without
+//                    focus-events / headless mode are all safe no-ops).
+//   focused        — true while focus is in, false while out.
+//   unread         — set when a notable event happens while unfocused;
+//                    cleared on focus in.
+
+const FOCUS_IN = "\x1b[I";
+const FOCUS_OUT = "\x1b[O";
+const FOCUS_RE = /\x1b\[[IO]/g;
+
+/** Whether the unread dot should render right now. */
+function showUnread(state: AppState): boolean {
+  return state.focusSupported && state.unread;
+}
+
+/** Walked-away + notable event ⇒ light the dot. */
+function markUnreadIfUnfocused(state: AppState): void {
+  if (state.focusSupported && !state.focused) state.unread = true;
+}
+
+/**
+ * Raw-input listener for xterm focus events. Returns a filtered payload that
+ * strips the \x1b[I / \x1b[O sequences so the editor never sees them.
+ */
+function handleFocusInput(data: string, state: AppState, refresh: () => void): { data?: string; consume?: boolean } | undefined {
+  const hasIn = data.includes(FOCUS_IN);
+  const hasOut = data.includes(FOCUS_OUT);
+  if (!hasIn && !hasOut) return;
+  if (hasIn) {
+    state.focusSupported = true;
+    state.focused = true;
+    state.unread = false;
+  }
+  if (hasOut) {
+    state.focusSupported = true;
+    state.focused = false;
+  }
+  refresh();
+  const rest = data.replace(FOCUS_RE, "");
+  return rest.length > 0 ? { data: rest } : { consume: true };
+}
+
+/** Re-render the title after a focus change (raw-input callbacks have no ctx). */
+function refreshTitleAfterFocus(pi: ExtensionAPI, state: AppState): void {
+  if (!state.uiCtx) return;
+  if (state.isWorking) {
+    updateTitleFrame(pi, state.uiCtx, state, state.pendingCount, showUnread(state));
+  } else {
+    state.uiCtx.ui.setTitle(buildIdleTitle(pi, state.pendingCount, showUnread(state)));
+  }
 }
 
 // ── Working message timer ──
@@ -278,7 +383,7 @@ async function autoGenerateTitle(pi: ExtensionAPI, ctx: ExtensionContext, state:
       .replace(/^["']|["']$/g, "").trim();
     if (title && title.length > 0 && title.length <= 60) {
       pi.setSessionName(title);
-      if (!state.isWorking) ctx.ui.setTitle(buildIdleTitle(pi));
+      if (!state.isWorking) ctx.ui.setTitle(buildIdleTitle(pi, state.pendingCount, showUnread(state)));
     }
   } catch { /* best-effort */ }
   finally { state.isAutoTitling = false; }
@@ -483,13 +588,23 @@ export default function (pi: ExtensionAPI) {
     state.isRetrying = false;
 
     state.lastAgentDuration = null;
+    state.pendingCount = 0; // fresh session ⇒ queue is always empty
+    state.uiCtx = ctx;
+
+    // Subscribe to xterm focus events (CSI I / CSI O) so the ◉ unread dot can
+    // track whether the user is actually looking at this terminal. Re-register
+    // per session; the previous subscription is dropped when a new session starts.
+    state.terminalInputUnsub?.();
+    state.terminalInputUnsub = ctx.ui.onTerminalInput((data) =>
+      handleFocusInput(data, state, () => refreshTitleAfterFocus(pi, state)),
+    );
 
     // Use pi's built-in working indicator (accent-colored braille spinner) so
     // the symbol in front of "Working for XXs" matches pi exactly. We
     // intentionally do NOT call setWorkingIndicator() with a custom spinner:
     // overriding it diverges from pi's look and needlessly rebuilds the
     // loader. The elapsed-time text is supplied via setWorkingMessage().
-    ctx.ui.setTitle(buildIdleTitle(pi));
+    ctx.ui.setTitle(buildIdleTitle(pi, state.pendingCount, showUnread(state)));
 
     // Initial git refresh + start fs.watch on .git state
     void doRefreshGit(ctx.cwd);
@@ -508,6 +623,8 @@ export default function (pi: ExtensionAPI) {
     // Restore built-in footer
     ctx.ui.setFooter(undefined);
 
+    state.uiCtx = null;
+    state.terminalInputUnsub = null;
     stopGitWatcher();
     if (state.ttftTimer) { clearInterval(state.ttftTimer); state.ttftTimer = null; }
     if (state.gitRefreshTimer) { clearTimeout(state.gitRefreshTimer); state.gitRefreshTimer = null; }
@@ -524,7 +641,13 @@ export default function (pi: ExtensionAPI) {
     state.isRetrying = false; // consume the retry flag
     state.isWorking = true;
     state.lastAgentDuration = null;
-    startTitleAnimation(pi, ctx, state);
+    state.uiCtx = ctx;
+    startTitleAnimation(pi, ctx, state, () => {
+      // Reconcile the count against the boolean each tick (100ms), then
+      // render the freshest remaining count. Covers hot-reload leftovers.
+      if (state.activeCtx) reconcilePendingCount(state.activeCtx, state);
+      return { pending: state.pendingCount, unread: showUnread(state) };
+    });
     // Only reset the timer on fresh starts; retry/continuation attempts keep
     // the same elapsed-time counter running across attempts.
     if (!wasAlreadyWorking && !isRetryRecovery) {
@@ -535,7 +658,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_end", async (event, ctx) => {
     state.isWorking = false;
     stopTitleAnimation(ctx, state);
-    ctx.ui.setTitle(buildIdleTitle(pi));
+    markUnreadIfUnfocused(state);
+    ctx.ui.setTitle(buildIdleTitle(pi, state.pendingCount, showUnread(state)));
 
     // A run ending in error is normally followed by pi's auto-retry or a
     // compaction continuation. Keep the working timer running so the next
@@ -567,15 +691,45 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_start", async (_event, ctx) => {
     if (state.isWorking) {
-      updateTitleFrame(pi, ctx, state);
+      updateTitleFrame(pi, ctx, state, state.pendingCount, showUnread(state));
     }
+  });
+
+  // ── Queued message tracking (steer / followUp → title badge) ──
+  //
+  // Accounting rules live in reconcilePendingCount above; these handlers
+  // keep the count in sync with pi's queue lifecycle.
+
+  pi.on("input", async (event, ctx) => {
+    if (!event.streamingBehavior) return;
+    // prompt() emits this event right before queueing; streamingBehavior is
+    // only set while streaming, in which case the message is always queued.
+    state.pendingCount += 1;
+    markUnreadIfUnfocused(state);
+    // Working: the 100ms title tick picks it up. Idle: refresh immediately
+    // (defensive — queueing normally only happens while streaming).
+    if (!state.isWorking) ctx.ui.setTitle(buildIdleTitle(pi, state.pendingCount, showUnread(state)));
+  });
+
+  pi.on("message_start", async (event, ctx) => {
+    if (event.message?.role !== "user") return;
+    // Queue consumption removes the message BEFORE extension events fire, so
+    // hasPendingMessages() here is the post-consumption state.
+    let hasPending = true;
+    try { hasPending = ctx.hasPendingMessages(); } catch { /* session boundary */ }
+    if (hasPending) {
+      if (state.pendingCount > 0) state.pendingCount -= 1;
+    } else {
+      state.pendingCount = 0;
+    }
+    if (!state.isWorking) ctx.ui.setTitle(buildIdleTitle(pi, state.pendingCount, showUnread(state)));
   });
 
   // ── Tool execution ──
 
   pi.on("tool_execution_start", async (_event, ctx) => {
     if (state.isWorking && state.titleTimer) {
-      updateTitleFrame(pi, ctx, state);
+      updateTitleFrame(pi, ctx, state, state.pendingCount, showUnread(state));
     }
     // Refresh the elapsed-time text only. Do NOT call setWorkingVisible(true)
     // here: force-recreating pi's status indicator on every tool start fights
@@ -588,7 +742,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_execution_end", async (_event, ctx) => {
     if (state.isWorking && state.titleTimer) {
-      updateTitleFrame(pi, ctx, state);
+      updateTitleFrame(pi, ctx, state, state.pendingCount, showUnread(state));
     }
   });
 
@@ -641,7 +795,7 @@ export default function (pi: ExtensionAPI) {
   // ── Model changes ──
 
   pi.on("model_select", async (_event, ctx) => {
-    if (!state.isWorking) ctx.ui.setTitle(buildIdleTitle(pi));
+    if (!state.isWorking) ctx.ui.setTitle(buildIdleTitle(pi, state.pendingCount, showUnread(state)));
     immediateUpdate(ctx);
   });
 

@@ -2,6 +2,9 @@
  * Terminal Title Module
  *
  * Manages the terminal emulator's tab/window title to show:
+ * - ◉ unread dot (lit when the terminal is unfocused and something notable
+ *   happened; cleared on focus in — xterm focus reporting, CSI 1004)
+ * - ⏎N badge (queued steer/followUp messages still pending)
  * - Current working directory and session name
  * - Animated braille spinner during agent activity
  * - Tool execution context
@@ -33,28 +36,59 @@ function getTitleParts(pi: ExtensionAPI) {
   };
 }
 
-export function buildWorkingTitle(pi: ExtensionAPI, frame: string): string {
+/**
+ * Queue badge: ⏎ (U+23CE) + remaining count of queued steer/followUp messages.
+ * Hidden entirely when nothing is queued, so the title stays unchanged in the
+ * common case. Kept right after the π symbol so terminal tab truncation
+ * (which eats the right edge) never cuts it off.
+ */
+function buildQueueBadge(pendingCount: number): string | null {
+  return pendingCount > 0 ? `\u23CE${pendingCount}` : null;
+}
+
+/** Unread marker: ◉ (U+25C9) prefix, first token of the title. */
+function buildHead(prefix: string, unread: boolean): string {
+  return unread ? `\u25C9 ${prefix}` : prefix;
+}
+
+export function buildWorkingTitle(pi: ExtensionAPI, _frame: string, pendingCount = 0, unread = false): string {
   const { cwd, session } = getTitleParts(pi);
-  const parts = [`${frame} \u03C0`, cwd];
+  // Spinner prefix intentionally dropped: working title stays static (`π ...`),
+  // matching the idle title. Call sites still pass the current frame; ignored.
+  const head = buildHead("\u03C0", unread);
+  const parts = [head];
+  const badge = buildQueueBadge(pendingCount);
+  if (badge) parts.push(badge);
+  parts.push(cwd);
   if (session) parts.push(session);
   return parts.join(" \u00B7 ");
 }
 
-export function buildIdleTitle(pi: ExtensionAPI): string {
+export function buildIdleTitle(pi: ExtensionAPI, pendingCount = 0, unread = false): string {
   const { cwd, session } = getTitleParts(pi);
-  const parts = ["\u03C0", cwd];
+  const head = buildHead("\u03C0", unread);
+  const parts = [head];
+  const badge = buildQueueBadge(pendingCount);
+  if (badge) parts.push(badge);
+  parts.push(cwd);
   if (session) parts.push(session);
   return parts.join(" \u00B7 ");
 }
 
 // ── Animation lifecycle ──
 
-export function startTitleAnimation(pi: ExtensionAPI, ctx: ExtensionContext, state: TitleState): void {
+export function startTitleAnimation(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  state: TitleState,
+  getTitleData?: () => { pending: number; unread: boolean },
+): void {
   if (state.titleTimer) return;
   state.activeCtx = ctx;
   state.titleTimer = setInterval(() => {
     if (!state.activeCtx) return;
-    state.activeCtx.ui.setTitle(buildWorkingTitle(pi, SPINNER_FRAMES[state.frameIndex % SPINNER_FRAMES.length]!));
+    const data = getTitleData?.() ?? { pending: 0, unread: false };
+    state.activeCtx.ui.setTitle(buildWorkingTitle(pi, SPINNER_FRAMES[state.frameIndex % SPINNER_FRAMES.length]!, data.pending, data.unread));
     state.frameIndex++;
   }, 100);
 }
@@ -66,7 +100,7 @@ export function stopTitleAnimation(ctx: ExtensionContext, state: TitleState): vo
 }
 
 /** Set the terminal title to the current animation frame (without advancing the spinner). */
-export function updateTitleFrame(pi: ExtensionAPI, ctx: ExtensionContext, state: TitleState): void {
-  ctx.ui.setTitle(buildWorkingTitle(pi, SPINNER_FRAMES[state.frameIndex % SPINNER_FRAMES.length]!));
+export function updateTitleFrame(pi: ExtensionAPI, ctx: ExtensionContext, state: TitleState, pendingCount = 0, unread = false): void {
+  ctx.ui.setTitle(buildWorkingTitle(pi, SPINNER_FRAMES[state.frameIndex % SPINNER_FRAMES.length]!, pendingCount, unread));
   state.activeCtx = ctx;
 }

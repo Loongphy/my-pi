@@ -33,7 +33,7 @@ const THINKING_LEVEL_COLORS: Record<string, ThemeColor> = {
     medium: "thinkingMedium",
     high: "thinkingHigh",
     xhigh: "thinkingXhigh",
-    max: "thinkingMax",
+    max: "thinkingMax" as ThemeColor, // 安装包 theme.d.ts 漏了 thinkingMax（0.84.3 运行时支持）
 };
 
 // ── Token formatting (mirrors pi's built-in footer) ──
@@ -166,6 +166,32 @@ export function computeLastCacheRate(ctx: ExtensionContext): number | null {
     return null;
 }
 
+// ── Right-side width budget (stable dir-mode decision) ──
+//
+// The dir-mode decision reserves a fixed maximum width for the enabled
+// right-side segments instead of measuring the live line. The budget is a
+// constant per config + model context window, so the chosen directory mode
+// only changes when the terminal width changes (or model/git state changes),
+// never as cache % / context tokens / tps / TTFT grow or shrink.
+//
+// Tuning: max widths bias toward compression (never overflow). For a looser
+// layout, replace the max strings below with typical widths plus a small
+// buffer.
+function rightSideBudget(config: StatusLineConfig, contextWindow: number | undefined): number {
+    const sep = 3; // " │ "
+    const segs: number[] = [];
+    if (config.cacheRate) segs.push(24); // "Cache 100.0%/last 100.0%"
+    if (config.contextUsage) {
+        const cw = formatTokens(contextWindow ?? 0);
+        segs.push(4 + 1 + cw.length + 1 + cw.length); // "100% X/Y"
+    }
+    if (config.tokenSpeed) segs.push(19); // "9999 t/s TTFT 99.9s"
+    if (config.tokenStats) segs.push(26); // "↑9999k ↓9999k R9999k W9999k"
+    if (segs.length === 0) return 0;
+    // 段间分隔符 + 与左侧之间的分隔符
+    return segs.reduce((a, b) => a + b + sep, 0) + sep;
+}
+
 // ── Status header rendering ──
 
 export interface HeaderRenderData {
@@ -225,7 +251,10 @@ export function buildStatusHeader(
         dirCandidates.push(null);
     }
 
-    const buildLine = (dir: string | null): string => {
+    // ── Left part (model + dir + git) — the only input the dir-mode
+    // decision may use. It depends on stable state (terminal width, model,
+    // git), never on the live token/cache/speed values below.
+    const buildLeft = (dir: string | null): string => {
         const parts: string[] = [];
 
         // 1. Model + Thinking:  gpt-5.5 low (no separator)
@@ -265,6 +294,15 @@ export function buildStatusHeader(
             if (badges.length > 0) branchStr += " " + badges.join(" ");
             parts.push(theme.fg("text", branchStr));
         }
+
+        if (parts.length === 0) return "";
+        return parts.join(sep);
+    };
+
+    const buildLine = (dir: string | null): string => {
+        const parts: string[] = [];
+        const left = buildLeft(dir);
+        if (left) parts.push(left);
 
         // 4. Token stats: ↑ tokens ↓ tokens
         // (stats precomputed once above — see buildStatusHeader)
@@ -342,18 +380,31 @@ export function buildStatusHeader(
         return parts.join(sep);
     };
 
-    // Pick the first candidate that fits the available width. When width is
-    // not provided (or ≤ 0) keep the historical behavior (full path, no fit
-    // check) — the widget render truncates as the final safety net.
-    let chosen = "";
-    for (const dir of dirCandidates) {
-        const line = buildLine(dir);
-        chosen = line;
-        if (width === undefined || width <= 0 || visibleWidth(line) <= width) {
-            break;
+    // Pick a directory mode using ONLY stable inputs — the terminal width, the
+    // left part (model + dir + git) and a fixed budget reserved for the right
+    // side. Live values (cache %, context tokens, tps, TTFT) must never enter
+    // this decision: they change width constantly during a turn, and using
+    // them made the header flicker between full path and basename as the
+    // assembled line crossed the width threshold back and forth.
+    //
+    // When width is not provided (or ≤ 0) keep the historical behavior (full
+    // path, no fit check) — the widget render truncates as the final safety
+    // net.
+    let dirMode: string | null;
+    if (width === undefined || width <= 0) {
+        dirMode = dirCandidates[0] ?? null;
+    } else {
+        const budget = rightSideBudget(config, ctx.model?.contextWindow);
+        dirMode = null;
+        for (const dir of dirCandidates) {
+            if (visibleWidth(buildLeft(dir)) + budget <= width) {
+                dirMode = dir;
+                break;
+            }
         }
+        if (dirMode === null) dirMode = dirCandidates[dirCandidates.length - 1] ?? null;
     }
-    return [chosen];
+    return [buildLine(dirMode)];
 }
 
 // ── Status line config items (for /statusline command) ──
