@@ -95,7 +95,14 @@ const RATE_LIMIT_RULES: RateLimitRule[] = [
     name: "workbuddy",
     match: (url) => url.includes("copilot.tencent.com"),
     isTerminal: (body) => {
-      if (extractErrorCode(body) === 14018) return true;
+      const code = extractErrorCode(body);
+      // code 6004 = 频率限制（rate limit）。腾讯会在 msg 里给出绝对重置
+      // 时间（如“将在 2026-08-29 14:32:45 UTC+8 重置”），通常要等到第二天才
+      // 恢复，重试毫无意义，且会无效占用 ~40 分钟的退避时间。直接认作 terminal
+      // 交回 provider，由 provider 把 msg 显示在 TUI 并停止 agent。
+      if (code === 6004) return true;
+      // code 14018 = 额度已用尽（quota exhausted），同样不可重试。
+      if (code === 14018) return true;
       return /额度已用尽|加量包|quota exhausted|insufficient_quota|usage limit/i.test(body);
     },
   },
@@ -118,6 +125,46 @@ const RATE_LIMIT_RULES: RateLimitRule[] = [
 // (Retry-After / body reset time), applied to any request, independent of
 // any provider signature.
 const HARD_LIMIT_WAIT_MS = 10 * 60 * 1000; // 10 minutes
+
+// ============================================================
+// Free-model retry ownership handoff (paired with opencode-provider.ts)
+//
+// Failures of the free-tier models listed in OPENCODE_FREE_RETRY_MODELS
+// (default "x-preview-f-free,ox-alpha-free") are retried solely by the
+// opencode-provider plugin on a fixed 60s cadence. 429 responses for such
+// requests are handed back untouched - they never enter this plugin's
+// wait-and-retry sequence - so exactly one retry owner remains per model.
+// Only requests to opencode.ai are matched; the model is identified by the
+// JSON body field "model":"<id>" (no streaming-body reads).
+// ============================================================
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const FREE_RETRY_MODEL_IDS = (process.env.OPENCODE_FREE_RETRY_MODELS || "x-preview-f-free,ox-alpha-free")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const FREE_MODEL_BODY_RE =
+  FREE_RETRY_MODEL_IDS.length > 0
+    ? new RegExp(`"model"\\s*:\\s*"(${FREE_RETRY_MODEL_IDS.map(escapeRegExp).join("|")})"`)
+    : undefined;
+
+/** True when this request targets a free model whose retries belong to opencode-provider. */
+function isFreeModelOwnedRequest(input: RequestInfo | URL, init?: RequestInit): boolean {
+  if (!FREE_MODEL_BODY_RE) return false;
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+  if (!/opencode\.ai/i.test(url)) return false;
+  try {
+    const request = typeof input === "object" && input !== null && !(input instanceof URL) ? (input as Request) : undefined;
+    const rawBody = init?.body != null ? init.body : request?.body;
+    if (typeof rawBody !== "string") return false;
+    return FREE_MODEL_BODY_RE.test(rawBody);
+  } catch {
+    return false;
+  }
+}
 
 export default function (pi: ExtensionAPI) {
   // State
@@ -465,6 +512,13 @@ export default function (pi: ExtensionAPI) {
 
     let attempts = 0;
     let response = await currentFetch.call(globalThis, input, init);
+
+    // Free-model ownership handoff: return any response as-is (including 429).
+    // The opencode-provider plugin owns retries for these models at a fixed
+    // 60s cadence; no annotation, no wait loop.
+    if (response.status === 429 && isFreeModelOwnedRequest(input, init)) {
+      return response;
+    }
 
     // 429s are retried uniformly at the fetch layer; request-logger no longer
     // rewrites them, responses pass through untouched
