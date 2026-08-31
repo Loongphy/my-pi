@@ -14,6 +14,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { homedir } from "node:os";
 import { complete } from "@earendil-works/pi-ai/compat";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type {
@@ -93,6 +94,18 @@ interface AppState {
   // must not schedule another refresh, or the loop never terminates.
   gitRefreshInFlight: boolean;
   lastGitRefreshEndMs: number;
+
+  // Qoder queue row: while the qoder provider publishes a fresh queue status
+  // (handshake file below), we hide pi's working loader and render BOTH the
+  // queue line and the elapsed-time line in our own widget, so the queue line
+  // sits ABOVE "Working for" (pi renders extension widgets only below its
+  // working row, so this is the only way to get that order).
+  queueOwnsRow: boolean;
+  queueAnimTimer: ReturnType<typeof setInterval> | null;
+  queueAnimFrame: number;
+  queueLine: string | null;
+  queueReadAt: number;
+  queueClaimTouchedAt: number;
 }
 
 function createInitialState(): AppState {
@@ -123,6 +136,12 @@ function createInitialState(): AppState {
     gitPollTimer: null,
     gitRefreshInFlight: false,
     lastGitRefreshEndMs: 0,
+    queueOwnsRow: false,
+    queueAnimTimer: null,
+    queueAnimFrame: 0,
+    queueLine: null,
+    queueReadAt: 0,
+    queueClaimTouchedAt: 0,
   };
 }
 
@@ -145,6 +164,116 @@ function formatDuration(ms: number, prefix: string): string {
   const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
   return `${prefix} ${[h > 0 && `${h}h`, m > 0 && `${m}m`, `${s}s`].filter(Boolean).join(" ")}`;
+}
+
+// ── Qoder queue row (rendered ABOVE "Working for") ──
+//
+// While a request sits in Qoder's model queue, the provider publishes its
+// status line to a PID-scoped handshake file (both extensions run in one pi
+// process, so the pid scopes the files to this instance and keeps concurrent
+// pi processes apart):
+//
+//   ~/.pi/agent/qoder-queue-<pid>.json   { "line": "...", "ts": <ms> }
+//   ~/.pi/agent/qoder-queue-<pid>.claim  our heartbeat while we render the row
+//
+// While the published line is fresh we hide pi's working loader and render
+// BOTH lines in our own widget — queue line first, then the elapsed-time line
+// — so the queue status appears above "Working for" instead of fighting over
+// pi's single working-message slot. When the queue clears we hand the row back
+// to pi (setWorkingVisible(true) recreates the loader with the elapsed message
+// our timer kept writing into pi's workingMessage field, so the text is
+// seamless). Both transitions happen once per queue episode, never per second.
+
+const QUEUE_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const QUEUE_FILE_FRESH_MS = 5_000; // ignore leftovers from a crashed provider
+const QUEUE_READ_THROTTLE_MS = 250;
+const QUEUE_CLAIM_THROTTLE_MS = 250;
+
+function agentDir(): string {
+  return process.env.PI_AGENT_DIR ?? path.join(homedir(), ".pi", "agent");
+}
+
+function queueStatePath(): string {
+  return path.join(agentDir(), `qoder-queue-${process.pid}.json`);
+}
+
+function queueClaimPath(): string {
+  return path.join(agentDir(), `qoder-queue-${process.pid}.claim`);
+}
+
+/** Latest published queue line, or null. Memoized so renders stay cheap. */
+function readQueueLine(state: AppState): string | null {
+  const now = Date.now();
+  if (state.queueLine !== null && now - state.queueReadAt < QUEUE_READ_THROTTLE_MS) return state.queueLine;
+  state.queueReadAt = now;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(queueStatePath(), "utf8")) as { line?: unknown; ts?: unknown };
+    const line = typeof parsed.line === "string" ? parsed.line : "";
+    const ts = typeof parsed.ts === "number" ? parsed.ts : 0;
+    state.queueLine = line && now - ts < QUEUE_FILE_FRESH_MS ? line : null;
+  } catch {
+    state.queueLine = null;
+  }
+  return state.queueLine;
+}
+
+/** Heartbeat: tells the provider we are rendering the row, so it stands down. */
+function touchQueueClaim(state: AppState): void {
+  const now = Date.now();
+  if (now - state.queueClaimTouchedAt < QUEUE_CLAIM_THROTTLE_MS) return;
+  state.queueClaimTouchedAt = now;
+  try {
+    fs.writeFileSync(queueClaimPath(), String(now));
+  } catch {}
+}
+
+function releaseQueueClaim(state: AppState): void {
+  state.queueClaimTouchedAt = 0;
+  try {
+    fs.rmSync(queueClaimPath(), { force: true });
+  } catch {}
+}
+
+/** Stop the 120ms render tick that animates our spinner while we own the row. */
+function stopQueueAnimTimer(state: AppState): void {
+  if (state.queueAnimTimer) {
+    clearInterval(state.queueAnimTimer);
+    state.queueAnimTimer = null;
+  }
+}
+
+/** Hand the working row back to pi (pi recreates the loader if streaming). */
+function releaseQueueRow(ctx: ExtensionContext, state: AppState): void {
+  if (!state.queueOwnsRow) return;
+  state.queueOwnsRow = false;
+  stopQueueAnimTimer(state);
+  releaseQueueClaim(state);
+  // While pi is auto-retrying we leave the row hidden: pi's retry countdown
+  // owns it, and the next turn_start / agent_start re-asserts the loader.
+  try {
+    if (state.isWorking && !state.isRetrying) ctx.ui.setWorkingVisible(true);
+  } catch {}
+}
+
+/** Enter/exit queue-row ownership from the provider's handshake file. */
+function syncQueueOwnership(ctx: ExtensionContext, state: AppState): void {
+  const queued = state.isWorking && readQueueLine(state) !== null;
+  if (queued && !state.queueOwnsRow) {
+    state.queueOwnsRow = true;
+    touchQueueClaim(state);
+    try {
+      ctx.ui.setWorkingVisible(false);
+    } catch {}
+    if (!state.queueAnimTimer) {
+      state.queueAnimTimer = setInterval(() => {
+        state.queueAnimFrame = (state.queueAnimFrame + 1) % QUEUE_SPINNER_FRAMES.length;
+        state.activeTui?.requestRender();
+      }, 120);
+    }
+  } else if (!queued && state.queueOwnsRow) {
+    releaseQueueRow(ctx, state);
+  }
+  if (state.queueOwnsRow) touchQueueClaim(state);
 }
 
 // ── Queued message count reconciliation ──
@@ -266,12 +395,18 @@ function startWorkingMessage(ctx: ExtensionContext, state: AppState) {
     // and the TUI becomes unresponsive ("卡死"). Letting pi own the loader
     // and only updating the text removes the conflict entirely.
     ctx.ui.setWorkingMessage(formatDuration(Date.now() - state.agentStartMs, "Working for"));
+    // Pick up / drop qoder queue-row ownership on the slow path too (the
+    // widget render is the fast path). This also keeps pi's workingMessage
+    // field fresh while the loader is hidden, so handing the row back to pi
+    // at queue end restores "Working for Xm Ys" without a text jump.
+    syncQueueOwnership(ctx, state);
   }, 1_000);
 }
 
 function stopWorkingMessage(ctx: ExtensionContext, state: AppState) {
   if (state.workingMessageTimer) { clearInterval(state.workingMessageTimer); state.workingMessageTimer = null; }
   state.agentStartMs = null;
+  releaseQueueRow(ctx, state);
   ctx.ui.setWorkingMessage();
 }
 
@@ -303,6 +438,9 @@ function finishWorking(ctx: ExtensionContext, state: AppState) {
   }
   const elapsedMs = state.agentStartMs !== null ? Date.now() - state.agentStartMs : null;
   state.agentStartMs = null;
+  // Hand the queue row back (releaseQueueRow keeps it hidden while pi is
+  // auto-retrying; the retry countdown owns the row until the next turn).
+  releaseQueueRow(ctx, state);
 
   if (elapsedMs !== null) {
     const total = Math.round(elapsedMs / 1000);
@@ -405,6 +543,21 @@ function createWidgetFactory(
         // Don't cache by width — state (gitStatus, tokenSpeed, etc.) changes
         // asynchronously and must always re-compute on re-render.
         const lines: string[] = [];
+        // Queue-row ownership is driven from here (not just the 1s timer) so a
+        // queue episode is picked up within one render frame and the claim
+        // heartbeat stays fresh while we own the row.
+        syncQueueOwnership(ctx, state);
+        if (state.queueOwnsRow && state.isWorking) {
+          // Queue line first, then the elapsed-time line - this ordering is
+          // the whole point: the queue status sits ABOVE the Working-for row.
+          const queueLine = readQueueLine(state);
+          if (queueLine) lines.push(truncateToWidth(queueLine, width));
+          if (state.agentStartMs !== null) {
+            const spinner = QUEUE_SPINNER_FRAMES[state.queueAnimFrame] ?? "⠹";
+            const text = formatDuration(Date.now() - state.agentStartMs, "Working for");
+            lines.push(truncateToWidth(`${theme.fg("accent", spinner)} ${theme.fg("muted", text)}`, width));
+          }
+        }
         if (state.lastAgentDuration) {
           const text = `Worked for ${state.lastAgentDuration}`;
           const plainLeft = `─ ${text} ─`;
@@ -623,6 +776,13 @@ export default function (pi: ExtensionAPI) {
     // Restore built-in footer
     ctx.ui.setFooter(undefined);
 
+    // Queue-row teardown: pi rebuilds its widget container on session switch,
+    // so drop the claim heartbeat and the ownership state with it.
+    stopQueueAnimTimer(state);
+    releaseQueueClaim(state);
+    state.queueOwnsRow = false;
+    state.queueLine = null;
+
     state.uiCtx = null;
     state.terminalInputUnsub = null;
     stopGitWatcher();
@@ -642,6 +802,14 @@ export default function (pi: ExtensionAPI) {
     state.isWorking = true;
     state.lastAgentDuration = null;
     state.uiCtx = ctx;
+    // New run: drop any cached queue line (the provider republishes it) and
+    // make sure pi's working loader is on screen — after a retry backoff in
+    // which we owned the row, pi will not recreate it on its own.
+    state.queueLine = null;
+    state.queueReadAt = 0;
+    try {
+      ctx.ui.setWorkingVisible(true);
+    } catch {}
     startTitleAnimation(pi, ctx, state, () => {
       // Reconcile the count against the boolean each tick (100ms), then
       // render the freshest remaining count. Covers hot-reload leftovers.
@@ -692,6 +860,16 @@ export default function (pi: ExtensionAPI) {
   pi.on("turn_start", async (_event, ctx) => {
     if (state.isWorking) {
       updateTitleFrame(pi, ctx, state, state.pendingCount, showUnread(state));
+    }
+    // After a retry backoff during which we owned (and hid) the working row,
+    // the retried attempt needs the loader back: pi's turn_start cleared the
+    // retry indicator, and pi will not recreate the loader while we hold
+    // workingVisible=false. A no-op when the loader is already on screen, and
+    // skipped while we still own the row (a re-queued attempt).
+    if (state.isWorking && !state.queueOwnsRow) {
+      try {
+        ctx.ui.setWorkingVisible(true);
+      } catch {}
     }
   });
 

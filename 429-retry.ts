@@ -96,11 +96,18 @@ const RATE_LIMIT_RULES: RateLimitRule[] = [
     match: (url) => url.includes("copilot.tencent.com"),
     isTerminal: (body) => {
       const code = extractErrorCode(body);
-      // code 6004 = 频率限制（rate limit）。腾讯会在 msg 里给出绝对重置
-      // 时间（如“将在 2026-08-29 14:32:45 UTC+8 重置”），通常要等到第二天才
-      // 恢复，重试毫无意义，且会无效占用 ~40 分钟的退避时间。直接认作 terminal
-      // 交回 provider，由 provider 把 msg 显示在 TUI 并停止 agent。
-      if (code === 6004) return true;
+      // code 6000 / 6004 = 频率限制（rate limit）。腾讯会在 msg 里给出绝对重置
+      // 时间（如“将在 2026-08-31 22:00:03 UTC+8 重置”），通常要等数小时甚至
+      // 第二天才恢复，重试毫无意义，且会无效占用 ~40 分钟的退避时间。直接认作
+      // terminal 交回 provider，由 provider 把 msg 显示在 TUI 并停止 agent。
+      // （实测：hy4-preview 的频率限制 429 是 code 6000，不是 6004——两个都认。）
+      if (code === 6000 || code === 6004) return true;
+      // code 6020 = 容量排队（capacity queue），请求已被服务端收进队列，需要
+      // 轮询 /v2/chat/queue/status 等到 ready 后原样重发（provider 的
+      // waitForCapacityQueue 干这件事）；6021/6022 是终态（队列满/排队数超限）。
+      // 一律交回 provider，绝不在此盲目重发——重发会回到队尾，且占用 15 次
+      // 重试预算。
+      if (code === 6020 || code === 6021 || code === 6022) return true;
       // code 14018 = 额度已用尽（quota exhausted），同样不可重试。
       if (code === 14018) return true;
       return /额度已用尽|加量包|quota exhausted|insufficient_quota|usage limit/i.test(body);
