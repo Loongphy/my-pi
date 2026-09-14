@@ -2,7 +2,13 @@
  * shortcuts - Keyboard shortcuts for pi
  *
  * Adds:
- *   Ctrl+Shift+C  - Copy current input box content to clipboard
+ *   Alt+C  - Copy current input box content to clipboard
+ *
+ * Note: deliberately NOT Ctrl+Shift+C. Under Windows Terminal that chord belongs
+ * to the terminal's own Copy action: with any text selected in the terminal,
+ * WT copies the selection and never delivers the key to pi (it only forwards
+ * Ctrl+Shift+C when no selection exists). Alt+C is not bound by WT or by any
+ * built-in pi/extension binding.
  */
 
 import { execSync, spawnSync } from "node:child_process";
@@ -62,7 +68,7 @@ function copyToClipboard(text: string): boolean {
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.registerShortcut("ctrl+shift+c", {
+  pi.registerShortcut("alt+c", {
     description: "Copy input box content to clipboard",
     handler: async (ctx) => {
       const text = ctx.ui.getEditorText();

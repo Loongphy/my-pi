@@ -81,8 +81,9 @@ A comprehensive status bar suite with multiple modules:
 
 ![editor](https://github.com/user-attachments/assets/37fdd8a3-f924-4829-a4eb-ad9b2f42c187)
 
-- **Composer** — codex-style input area with a bold `❯` prompt (highlighted in `!bash` mode)
-- **Skill mentions** — `$skill` mentions render bold in the theme accent; typing `$` opens the mention picker with all indexed skills (agents, codex, claude, pi); unknown `$tokens` are left untouched
+- **Composer** — codex-style input area with a bold `❯` prompt (highlighted in `!bash` mode, `！` alias included)
+- **Skill mentions** — `$skill` mentions render bold in the theme accent; typing `$` opens the mention picker with all indexed skills (agents, codex, claude, pi); unknown `$tokens` are left untouched. Chinese IMEs work too: Shift+4 gives `￥`, which opens the same picker and is rewritten to `$` **in the composer** the moment the token names a skill (`￥coss` → `$coss` under the caret), so highlighting and the submitted prompt keep the plain `$` rules — and a non-resolving `￥100` stays a price
+- **Bash alias** — Chinese IMEs: Shift+1 gives `！` (U+FF01), rewritten to `!` **in the composer** when leading (`！ls` → `!ls`, `！！`/`！!`/`!！` → `!!`); a `！` elsewhere stays punctuation (`你好！` never runs)
 
 **File:** `editor.ts`
 
@@ -90,7 +91,7 @@ A comprehensive status bar suite with multiple modules:
 
 ### request-logger
 
-Logs every provider request to `~/.pi/agent/requests/<session>.request.log` — HTTP status, headers, token counts, model info — with sensitive query parameters sanitized.
+Logs every provider request to `~/.pi/agent/requests/<session>.request.log` — HTTP status, headers, token counts, model info, and the complete decoded request body (including gzip-compressed provider payloads) — with sensitive query parameters and auth headers sanitized.
 
 **File:** `request-logger.ts`
 
@@ -98,9 +99,32 @@ Logs every provider request to `~/.pi/agent/requests/<session>.request.log` — 
 
 ### shortcuts
 
-`Ctrl+Shift+C` copies the current editor content to the system clipboard.
+`Alt+C` copies the current editor content to the system clipboard. (Formerly `Ctrl+Shift+C`, which Windows Terminal intercepts for its own Copy action whenever any text is selected in the terminal — the key never reached pi in that state.)
 
 **File:** `shortcuts.ts`
+
+#### Built-in keybindings (`~/.pi/agent/keybindings.json`)
+
+Beyond what this extension registers, the local config remaps two **pi built-in** actions to match codex-cli's input habits:
+
+```json
+{
+  "app.message.followUp": "ctrl+enter",
+  "app.message.dequeue": "alt+up"
+}
+```
+
+| Action | Key here | pi default | codex-cli | Why |
+|---|---|---|---|---|
+| `app.message.followUp` — queue the draft as a follow-up (delivered after the current turn ends; plain `Enter` while streaming *steers* instead) | `Ctrl+Enter` | `Alt+Enter` (`Ctrl+Q` on Windows/WSL) | `composer.queue` = `Tab` | `Ctrl+Enter` is the usual "send/queue without interrupting" habit, and it frees `Alt+Enter` — codex binds that to a newline, and Windows Terminal grabs it for fullscreen (pi's own newline is `shift+enter`/`ctrl+j`, so nothing is lost) |
+| `app.message.dequeue` — pull the queued messages back into the editor | `Alt+↑` | `Alt+↑` (`Alt+Q` on Windows/WSL) | `chat.edit_queued_message` = `Alt+↑` (+ `Shift+←`) | Same chord as codex; written out explicitly so Windows/WSL also gets `Alt+↑` instead of pi's platform-specific `Alt+Q` default |
+
+Two caveats, both from pi's own `docs/terminal-setup.md`:
+
+- `Ctrl+Enter` needs a terminal that reports modified Enter distinctly (Kitty keyboard protocol: Kitty, Ghostty, WezTerm, iTerm2, Windows Terminal, VS Code ≥1.109.5). xfce4-terminal and terminator cannot tell it apart from plain `Enter` — there the chord arrives as `Enter`, i.e. it steers instead of queueing.
+- After editing `keybindings.json`, run `/reload` in pi to apply it.
+
+**File:** `~/.pi/agent/keybindings.json` (not an extension)
 
 ---
 
@@ -110,14 +134,35 @@ Logs every provider request to `~/.pi/agent/requests/<session>.request.log` — 
 
 Retries transient HTTP 429 responses automatically (any provider). The wait follows an incremental sequence — 5s, 10s, 20s, 30s, 60s, 90s, ... (+30s per retry after 30s), up to 15 attempts, or the server's `Retry-After` / body reset time when provided — with a live status-bar countdown. Hard limits fail fast: a wait longer than 10 min, or a provider's permanent-limit signature (e.g. workbuddy quota exhausted, opencode usage-limit errors), surfaces the response immediately with the reset time instead of retrying.
 
+OpenCode-specific: before an opencode.ai usage-limit 429 is handed back to the SDK, the response body is annotated with the server-provided reset time — `resets_at` in the codex TUI's format (`14:30` / `14:30 5 Mar`) plus the remaining duration `resets_in`, both top-level and inside `error`, with a `(Free usage limit resets at 14:30)` suffix appended to `error.message` — so the final error message the TUI displays carries the reset time (e.g. `{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later. (Free usage limit resets at 14:30)","resets_at":"14:30","resets_in":"8h 7m 17s"}`). Other providers keep the historical top-level `resets_in` only.
+
 **Command:** `/429-retry` toggles on/off · `/429-retry <seconds>` sets a fixed wait time for every retry
 
 **File:** `429-retry.ts`
 
 ---
 
-### thinking-level-memory
+### thinking-level
 
-Remembers the last thinking level per model and restores it automatically when you switch back via `/model`, the model selector, or model cycling. Models without a remembered level are raised to their highest supported level (any of the built-in levels: minimum, low, medium, high, xhigh, max) whenever the current level is below it — so switching from a model that only supports `high` to one that supports `max` lands on `max`, never on the inherited `high`. If the level is already at the new model's ceiling, it stays as-is. Manual changes always update the memory. Priority: remembered level → scoped `--models model:level` → max default.
+One extension for everything about thinking (reasoning) levels — it both **remembers** your choice per model and **shows** what each model supports.
 
-**File:** `thinking-level-memory.ts`
+**Memory.** Remembers the last thinking level per model and restores it automatically when you switch back via `/model`, the model selector, or model cycling. Models without a remembered level are raised to their highest supported level (any of the built-in levels: minimum, low, medium, high, xhigh, max) whenever the current level is below it — so switching from a model that only supports `high` to one that supports `max` lands on `max`, never on the inherited `high`. If the level is already at the new model's ceiling, it stays as-is. Manual changes always update the memory. Priority: remembered level → scoped `--models model:level` → max default.
+
+**/model display.** Shows the levels a model supports right on the name line of pi's built-in `/model` picker, so you can see what a model can do with thinking *before* selecting it:
+
+```
+Model Name: MiMo V2.5 Free · reasoning: off minimal low medium high
+Model Name: Kimi K3 · reasoning: low high max
+Model Name: Qwen3 Coder Next · no reasoning
+```
+
+- The level list comes from pi's own `getSupportedThinkingLevels(model)` — the same function behind the `/thinking` options and the level clamp on switch — so it can never disagree with what pi will actually accept. Models that null out every level (`off` only) read `no reasoning`.
+- The level you are currently on is highlighted in pi's success colour — the same colour as the `Model catalogs refreshed.` line below — but only while the highlighted row *is* the current model. pi exposes no colour API to extensions, so the colour is lifted out of pi's own rendered output (success first, accent as fallback), which keeps it exact for every theme including auto dark/light switching.
+- The extra text reuses the ANSI prefix pi put on that line, so it keeps the theme's muted colour under any theme.
+- `/model` is a built-in interactive command handled before extension commands and before the `input` event, so it cannot be overridden by registering a command of the same name. This extension instead wraps the exported `ModelSelectorComponent.updateList`, which every selection change, search keystroke and catalog refresh goes through. If pi's internals change, the wrapper finds nothing to rewrite and `/model` keeps working untouched.
+
+**No commands, no switches** — install it and both parts just run.
+
+**Storage:** `~/.pi/agent/thinking-level-memory.json` (remembered levels, written automatically as you pick levels)
+
+**File:** `thinking-level.ts` (merged from the former `thinking-level-memory.ts` + `model-reasoning.ts`)

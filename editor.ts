@@ -32,6 +32,25 @@
  * `interface.short-description` → SKILL.md `metadata.short-description` →
  * frontmatter `description`), truncated to 60 chars.
  *
+ * Chinese input is a first-class citizen, because Shift+4 on a Pinyin IME does
+ * not produce `$`: `￥` (U+FFE5, the yuan sign the IME emits) opens the very
+ * same picker, and the composer rewrites it to the canonical `$` *in place* the
+ * instant the token names a skill — type `￥coss` and the `￥` flips to `$`
+ * under the caret as the final `s` lands. Everything after that point
+ * (highlighting, completion, undo, the submitted prompt) keeps its original
+ * `$`-only logic; only the input side knows about the alias. A `￥` that does
+ * not resolve is left exactly as typed, so `￥100` stays a price and `￥HOME`
+ * stays a shell variable. Token boundaries are CJK-friendly too — any non-word
+ * character starts a mention, since Chinese is written without spaces, so
+ * `用￥coss` completes just like `用 $coss`.
+ *
+ * Bash mode gets the same treatment for its own Shift+1 problem: on a Pinyin
+ * IME that key emits `！` (U+FF01, fullwidth exclamation) instead of `!`, so a
+ * leading `！` is rewritten to the canonical `!` *in place* — `！ls` behaves
+ * exactly like `!ls` (green `❯`, direct execution), and `！！`/`！!`/`!！` behave
+ * like `!!` (excluded from context). Only the leading run is touched, so a
+ * `！` anywhere else stays Chinese punctuation (`你好！` is never a command).
+ *
  * Four skill formats are indexed (global + project-local). A skill is any
  * directory containing a SKILL.md (or the skills dir itself holding SKILL.md);
  * its name comes from the frontmatter `name:` field, falling back to the
@@ -58,10 +77,12 @@
  * to tell sources apart visually, override SKILL_SOURCE_COLORS below — e.g.
  * give `pi` its own color — instead of editing the renderer.
  *
- * The index is built once per session (session_start) from ctx.cwd; install
- * new skills and `/reload` (or start a new session) to refresh it. Rendering is
- * ANSI-aware: tokens keep their highlight even when the editor's inverted
- * cursor sits on a character inside the token.
+ * The index is built at session_start from ctx.cwd and is **refetchable**: it
+ * rescans the skills directories when their contents change (mtime-signature,
+ * throttled to once per second), so skills added mid-session appear in `$`
+ * completion/highlighting without `/reload`. A `/reload` (or new session) also
+ * rebuilds it. Rendering is ANSI-aware: tokens keep their highlight even when
+ * the editor's inverted cursor sits on a character inside the token.
  *
  * Usage: pi --extension ./examples/extensions/codex-composer.ts
  */
@@ -96,6 +117,106 @@ const PROMPT_CHAR = "❯";
 const PROMPT_GUTTER_COLS = 2;
 
 const RESET_BG = "\x1b[49m";
+
+/**
+ * Mention sigils. `$` is the canonical form; `￥` (U+FFE5, the yuan sign Pinyin
+ * layouts emit for Shift+4 in Chinese mode — the IME never hands over a plain
+ * `$` there) is its input alias. Both are a single UTF-16 code unit, so they
+ * can be handled with the same slicing arithmetic (the editor's `cursorCol` is
+ * a code-unit index, not a display width).
+ *
+ * `￥` is only ever an *input* alias: the moment one of them spells a skill
+ * name, the composer rewrites it to `$name` in place (see
+ * `CodexComposer.normalizeMentionSigils`), so everything downstream —
+ * highlighting, completion, undo history, the prompt sent to the model — keeps
+ * the original `$`-only rules with no foreign-sigil logic anywhere. A `￥` that
+ * does not resolve (a price like `￥100`, a shell var like `￥HOME`) is left
+ * exactly as typed.
+ *
+ * The generic fullwidth dollar `＄` (U+FF04) is deliberately not included: it
+ * needs a whole-input-mode switch, and in that mode the skill name arrives
+ * fullwidth too (`＄ｃｏｓｓ`), which no ASCII-only skill tokenizer can match — so
+ * listing it would buy nothing.
+ */
+const MENTION_SIGILS = ["$", "￥"] as const;
+
+/** Sigils that still have to be rewritten to the canonical `$`. */
+const FOREIGN_SIGILS: readonly string[] = MENTION_SIGILS.slice(1);
+
+/** Character class matching any mention sigil, for embedding in regexes. */
+const SIGIL_CLASS = `[${MENTION_SIGILS.join("")}]`;
+
+/**
+ * The name part of a mention token — same shape as Codex's
+ * `is_mention_name_char` (a-z, A-Z, 0-9, _, -).
+ */
+const MENTION_TAIL = "[A-Za-z0-9][A-Za-z0-9_-]*";
+
+/** A full `￥name` token, for the in-place rewrite. */
+const FOREIGN_SIGIL_TOKEN_RE = new RegExp(`[${FOREIGN_SIGILS.join("")}]${MENTION_TAIL}`, "g");
+
+/** Whether `char` is a mention sigil (`$` or the `￥` input alias). */
+function isMentionSigil(char: string | undefined): boolean {
+	return char !== undefined && (MENTION_SIGILS as readonly string[]).includes(char);
+}
+
+/** Whether `text` starts with a mention sigil (i.e. is a `$`/`￥` token). */
+function startsWithMentionSigil(text: string): boolean {
+	return isMentionSigil(text[0]);
+}
+
+/** Whether `text` holds a sigil the composer still has to normalise. */
+function hasForeignSigil(text: string): boolean {
+	return FOREIGN_SIGILS.some((sigil) => text.includes(sigil));
+}
+
+/**
+ * The token-boundary rule, shared by the highlighter and the normaliser: a
+ * sigil only starts a mention when it does not continue a word, so `foo$bar`
+ * (and `foo￥bar`) is never a mention. Kept deliberately narrow — letters and
+ * digits only — so CJK glyphs and punctuation *do* start a token, which is what
+ * Chinese text without spaces needs.
+ */
+function isStandaloneTokenStart(text: string, start: number): boolean {
+	return start === 0 || !/[A-Za-z0-9]/.test(text[start - 1]!);
+}
+
+/**
+ * Bash sigils. `!` is the canonical form; `！` (U+FF01, the fullwidth
+ * exclamation a Pinyin IME emits for Shift+1 in Chinese mode — the IME never
+ * hands over a plain `!` there) is its input alias. Same idea as `$`/`￥`:
+ * the composer rewrites a leading `！` to `!` in place (see
+ * `CodexComposer.normalizeBashSigil`), so everything downstream — bash-mode
+ * detection, the green `❯` highlight, submit handling — keeps its original
+ * `!`-only logic with no foreign-sigil logic anywhere.
+ *
+ * Only the leading run matters: pi treats input as a bash command when the
+ * trimmed text starts with `!` (`!cmd` runs, `!!cmd` runs excluded from
+ * context). A `！` anywhere else (e.g. `你好！`) is untouched Chinese
+ * punctuation. Both sigils are a single UTF-16 code unit, so the swap keeps
+ * the editor's `cursorCol` (a code-unit index, not a display width) unchanged.
+ */
+const BASH_SIGIL = "!";
+const BASH_FOREIGN_SIGIL = "！"; // U+FF01
+
+/** Whether trimmed text starts a bash command with either sigil. */
+export function isBashModeText(text: string): boolean {
+	const trimmed = text.trimStart();
+	return trimmed.startsWith(BASH_SIGIL) || trimmed.startsWith(BASH_FOREIGN_SIGIL);
+}
+
+/**
+ * Normalise a submit/raw string's leading run: `！ls` → `!ls`, and `！！ls` /
+ * `！!ls` / `!！ls` → `!!ls`. Leading whitespace is preserved; anything past
+ * the leading run (including a mid-text `！`) is left exactly as typed.
+ */
+export function normalizeBashSubmitText(text: string): string {
+	const m = /^(\s*)([!！]+)/.exec(text);
+	if (!m || !m[2]!.includes(BASH_FOREIGN_SIGIL)) return text;
+	const prefix = m[1]!;
+	const run = m[2]!;
+	return prefix + run.replace(/！/g, BASH_SIGIL) + text.slice(prefix.length + run.length);
+}
 
 /**
  * Layout for the `$skill` picker list. pi's default SelectList column is 32
@@ -134,6 +255,103 @@ interface SkillEntry {
 	source: SkillSource;
 	/** One-line description from SKILL.md frontmatter, if present. */
 	description?: string;
+}
+
+/**
+ * Refetchable skill index: the `Map` reference is stable for the session, but
+ * its contents refresh when the skills directories change. This lets skills
+ * added mid-session appear in `$` completion/highlighting without `/reload`.
+ *
+ * Freshness is tracked by the max mtime of each watched root dir plus a
+ * short min-interval throttle, so the rescan is cheap and rare.
+ */
+interface RefetchableIndex {
+	/** Stable index map shared by all consumers. */
+	index: Map<string, SkillEntry>;
+	/** Roots (global + project-local) to rescan. */
+	roots: Array<{ dir: string; source: SkillSource }>;
+	/** Last signature (mtimeMs) of the roots; undefined = never scanned. */
+	lastSignature: string | undefined;
+	/** Earliest next rescan (ms); bounds the throttle. */
+	nextCheckAt: number;
+}
+
+/**
+ * Per-session refetchable index registry. Each `session_start` registers a
+ * fresh entry keyed by the stable `index` map; `refreshSkillIndexIfStale`
+ * looks it up to rescan in place.
+ */
+const refetchableIndexes = new WeakMap<Map<string, SkillEntry>, RefetchableIndex>();
+
+/** Min interval between staleness checks (ms). */
+const REFRESH_MIN_INTERVAL_MS = 1000;
+
+/**
+ * Compute a cheap change-signature for the roots: the newest mtimeMs among
+ * existing roots (dir + immediate child entries). Missing dirs contribute
+ * nothing. Child-entry mtime covers adding a new skill dir without touching
+ * the parent's mtime.
+ */
+function computeRootsSignature(roots: Array<{ dir: string; source: SkillSource }>): string {
+	let newest = 0;
+	for (const { dir } of roots) {
+		try {
+			const st = statSync(dir);
+			if (st.mtimeMs > newest) newest = st.mtimeMs;
+			for (const entry of readdirSync(dir, { withFileTypes: true })) {
+				if (entry.name.startsWith(".")) continue;
+				const full = join(dir, entry.name);
+				try {
+					const ms = statSync(full).mtimeMs;
+					if (ms > newest) newest = ms;
+				} catch {
+					// ignore unreadable entries
+				}
+			}
+		} catch {
+			// root missing/unreadable — skip
+		}
+	}
+	return String(newest);
+}
+
+/**
+ * Register a refetchable index for the session. Called once at `session_start`;
+ * the returned map is shared with the composer and `$` picker and refreshed
+ * in place by `refreshSkillIndexIfStale`.
+ */
+export function createRefetchableSkillIndex(cwd: string): Map<string, SkillEntry> {
+	const roots = collectSkillRoots(cwd);
+	const index = new Map<string, SkillEntry>();
+	rebuildSkillIndex(index, roots);
+	refetchableIndexes.set(index, {
+		index,
+		roots,
+		lastSignature: computeRootsSignature(roots),
+		nextCheckAt: Date.now() + REFRESH_MIN_INTERVAL_MS,
+	});
+	return index;
+}
+
+/**
+ * Rescan the roots into the index if anything changed (throttled).
+ * No-op for indexes not created via `createRefetchableSkillIndex` (e.g. tests).
+ */
+export function refreshSkillIndexIfStale(index: Map<string, SkillEntry>): void {
+	const ref = refetchableIndexes.get(index);
+	if (!ref) return;
+	const now = Date.now();
+	if (now < ref.nextCheckAt) return;
+	ref.nextCheckAt = now + REFRESH_MIN_INTERVAL_MS;
+	const signature = computeRootsSignature(ref.roots);
+	if (signature === ref.lastSignature) return;
+	ref.lastSignature = signature;
+	rebuildSkillIndex(index, ref.roots);
+}
+
+/** Whether `index` is a refetchable (session) index that may grow on refresh. */
+function hasRefetchableRoots(index: Map<string, SkillEntry>): boolean {
+	return refetchableIndexes.has(index);
 }
 
 /**
@@ -342,15 +560,15 @@ function scanSkillsDir(index: Map<string, SkillEntry>, dir: string, source: Skil
  * project-level skills root; it only appears in third-party tooling (e.g.
  * skilltap's symlink layout).
  */
-export function buildSkillIndex(cwd: string): Map<string, SkillEntry> {
-	const index = new Map<string, SkillEntry>();
-	const scanned = new Set<string>();
+export function collectSkillRoots(cwd: string): Array<{ dir: string; source: SkillSource }> {
+	const roots: Array<{ dir: string; source: SkillSource }> = [];
+	const seen = new Set<string>();
 
 	const addDir = (dir: string, source: SkillSource): void => {
 		const resolved = resolve(dir);
-		if (scanned.has(resolved)) return;
-		scanned.add(resolved);
-		scanSkillsDir(index, resolved, source);
+		if (seen.has(resolved)) return;
+		seen.add(resolved);
+		roots.push({ dir: resolved, source });
 	};
 
 	const home = homedir();
@@ -378,6 +596,24 @@ export function buildSkillIndex(cwd: string): Map<string, SkillEntry> {
 		dir = parent;
 	}
 
+	return roots;
+}
+
+/**
+ * (Re)build the skill index into `index` in place from the given roots.
+ * The `index` reference is kept stable so every consumer (composer highlight,
+ * `$` picker) sees refreshed contents without re-registration.
+ */
+export function rebuildSkillIndex(index: Map<string, SkillEntry>, roots: Array<{ dir: string; source: SkillSource }>): void {
+	index.clear();
+	for (const { dir, source } of roots) {
+		scanSkillsDir(index, dir, source);
+	}
+}
+
+export function buildSkillIndex(cwd: string): Map<string, SkillEntry> {
+	const index = new Map<string, SkillEntry>();
+	rebuildSkillIndex(index, collectSkillRoots(cwd));
 	return index;
 }
 
@@ -385,15 +621,37 @@ export function buildSkillIndex(cwd: string): Map<string, SkillEntry> {
 // `$skill` completion dropdown (codex-style mention picker)
 // ============================================================================
 
+/** A mention token anchored at the end of the text before the cursor. */
+const SKILL_TOKEN_AT_CARET_RE = new RegExp(
+	`(?:^|[^\\w])(${SIGIL_CLASS}${MENTION_TAIL}|${SIGIL_CLASS})$`,
+);
+
 /**
- * Extract a standalone `$mention` token that reaches the cursor, if any. The
- * token starts at a token boundary (start of text, space, or tab) — matching
- * the highlight rule, so `foo$bar` never completes. A bare `$` at the cursor
- * is a valid token (shows the full skill list, like `@` shows all files).
+ * Extract a standalone mention token (`$name` or the `￥name` alias) that
+ * reaches the cursor, if any. The token starts at a token boundary — start of
+ * text or any non-word character, matching the highlight rule, so `foo$bar`
+ * never completes while `用$bar` (CJK, no space) does. A bare sigil at the
+ * cursor is a valid token (shows the full skill list, like `@` shows all
+ * files).
  */
 export function extractSkillToken(textBeforeCursor: string): string | undefined {
-	const match = /(?:^|[ \t])(\$[A-Za-z0-9][A-Za-z0-9_-]*|\$)$/.exec(textBeforeCursor);
+	const match = SKILL_TOKEN_AT_CARET_RE.exec(textBeforeCursor);
 	return match?.[1];
+}
+
+/**
+ * The clause pi's built-in trigger pattern is missing for CJK input: it only
+ * starts a token after whitespace or at line start, so `用￥coss` never opens
+ * the picker. This alternative mirrors {@link extractSkillToken}'s boundary
+ * (any non-word character, including Chinese glyphs and punctuation) and is
+ * limited to the mention sigils, leaving `@`/`#` behavior untouched.
+ */
+const MENTION_BOUNDARY_TRIGGER_SOURCE = `(?:[^\\s\\w])${SIGIL_CLASS}[^\\s]*$`;
+
+/** Return `pattern` with the CJK mention boundary accepted as well. */
+function withMentionBoundaryTrigger(pattern: RegExp): RegExp {
+	if (pattern.source.includes(MENTION_BOUNDARY_TRIGGER_SOURCE)) return pattern;
+	return new RegExp(`${pattern.source}|${MENTION_BOUNDARY_TRIGGER_SOURCE}`, pattern.flags);
 }
 
 /**
@@ -422,6 +680,7 @@ export function displaySkillPath(path: string): string {
  * (with `…`) so the picker stays compact next to the narrow name column.
  */
 export function findSkillItems(index: Map<string, SkillEntry>, query: string): AutocompleteItem[] {
+	refreshSkillIndexIfStale(index);
 	const seen = new Set<string>();
 	const entries: SkillEntry[] = [];
 	for (const entry of index.values()) {
@@ -475,7 +734,9 @@ export function createSkillAutocompleteProvider(
 	index: Map<string, SkillEntry>,
 ): AutocompleteProvider {
 	return {
-		triggerCharacters: ["$"],
+		// `$` plus the `￥` input alias, so a Chinese IME's Shift+4 triggers exactly
+		// like the ASCII sigil (pi accepts any single-code-unit character).
+		triggerCharacters: [...MENTION_SIGILS],
 
 		async getSuggestions(lines, cursorLine, cursorCol, options) {
 			const currentLine = lines[cursorLine] ?? "";
@@ -493,9 +754,12 @@ export function createSkillAutocompleteProvider(
 		},
 
 		applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
-			if (prefix.startsWith("$")) {
-				// Replace the `$token` span with the selected mention (no trailing
-				// space, so mid-sentence insertion stays clean).
+			if (startsWithMentionSigil(prefix)) {
+				// Replace the token span with the selected mention (no trailing
+				// space, so mid-sentence insertion stays clean). `item.value` is
+				// always the canonical `$name`, which also normalises a `￥` typed
+				// through an IME back to `$` (before the composer's own rewrite has
+				// had a chance to, i.e. while the token is still a partial match).
 				const currentLine = lines[cursorLine] ?? "";
 				const beforePrefix = currentLine.slice(0, cursorCol - prefix.length);
 				const afterCursor = currentLine.slice(cursorCol);
@@ -520,7 +784,11 @@ export function createSkillAutocompleteProvider(
 // `$skill` token highlighting
 // ============================================================================
 
-/** Same shape as Codex's `is_mention_name_char` (a-z, A-Z, 0-9, _, -). */
+/**
+ * `$mention` tokens, as the highlighter sees them. Only the canonical sigil:
+ * `￥` is rewritten to `$` by the composer before a token can ever be
+ * highlighted, so this stays exactly what it was before Chinese input support.
+ */
 const SKILL_TOKEN_RE = /\$[A-Za-z0-9][A-Za-z0-9_-]*/g;
 
 /**
@@ -579,6 +847,8 @@ function buildVisibleMap(line: string): { visible: string; toRaw: number[] } {
  * span so a cursor character in the middle of a token doesn't kill the rest.
  */
 export function highlightSkillTokens(line: string, index: Map<string, SkillEntry>, theme: Theme): string {
+	if (index.size === 0 && !hasRefetchableRoots(index)) return line;
+	refreshSkillIndexIfStale(index);
 	if (index.size === 0 || !line.includes("$")) return line;
 
 	const { visible, toRaw } = buildVisibleMap(line);
@@ -587,7 +857,7 @@ export function highlightSkillTokens(line: string, index: Map<string, SkillEntry
 	let match: RegExpExecArray | null;
 	while ((match = SKILL_TOKEN_RE.exec(visible)) !== null) {
 		// Only standalone tokens: skip `$` that continues a word (`foo$bar`).
-		if (match.index > 0 && /[A-Za-z0-9]/.test(visible[match.index - 1]!)) continue;
+		if (!isStandaloneTokenStart(visible, match.index)) continue;
 		const entry = index.get(match[0].slice(1).toLowerCase());
 		if (!entry) continue;
 		const start = toRaw[match.index]!;
@@ -636,12 +906,79 @@ export class CodexComposer extends CustomEditor {
 			createAutocompleteList: (prefix: string, items: SelectItem[]) => SelectList;
 		}).createAutocompleteList;
 		(this as unknown as Record<string, unknown>).createAutocompleteList = (prefix: string, items: SelectItem[]) => {
-			if (prefix.startsWith("$")) {
+			if (startsWithMentionSigil(prefix)) {
 				const editor = this as unknown as { theme: EditorTheme; autocompleteMaxVisible: number };
 				return new SelectList(items, editor.autocompleteMaxVisible, editor.theme.selectList, SKILL_SELECT_LIST_LAYOUT);
 			}
 			return baseCreateAutocompleteList.call(this, prefix, items);
 		};
+
+		// Accept a mention token that starts after a non-word character, so CJK
+		// text (`用￥coss`, `，$coss`) triggers the picker even though Chinese is
+		// written without spaces. pi rebuilds this private field on every
+		// `setAutocompleteProvider()` (which the app calls again whenever a
+		// provider is added), so intercept the assignment instead of patching it
+		// once: every pattern the base class installs gets the extra clause.
+		let triggerPattern = withMentionBoundaryTrigger(
+			(this as unknown as { autocompleteTriggerPattern: RegExp }).autocompleteTriggerPattern,
+		);
+		Object.defineProperty(this, "autocompleteTriggerPattern", {
+			configurable: true,
+			get: () => triggerPattern,
+			set: (pattern: RegExp) => {
+				triggerPattern = withMentionBoundaryTrigger(pattern);
+			},
+		});
+
+		// Rewrite a resolvable `￥name` to `$name` (and a leading `！` to `!`)
+		// while the keystroke is still being handled. pi calls `onChange` from
+		// inside every text mutation and *before* the autocomplete trigger check,
+		// so shadowing the field with an accessor lets the swap happen mid-edit:
+		// the picker, the highlighter, the undo snapshots and the submitted prompt
+		// only ever see the canonical `$token` / `!` form, and the app's own
+		// handler is called with the corrected text.
+		let appOnChange: ((text: string) => void) | undefined;
+		const changeHook = (text: string): void => {
+			// Normalise first, and never inside the optional call below: `?.` short
+			// circuits the whole call *expression*, arguments included, so an app
+			// that never assigns `onChange` would silently disable the rewrite.
+			const changedMention = this.normalizeMentionSigils();
+			const changedBash = this.normalizeBashSigil();
+			const next = changedMention || changedBash ? this.getText() : text;
+			// Keep the receiver pi had when calling `this.onChange(...)`, in case its
+			// handler is a regular function that reads `this`.
+			appOnChange?.call(this, next);
+		};
+		Object.defineProperty(this, "onChange", {
+			configurable: true,
+			enumerable: true,
+			get: () => changeHook,
+			set: (handler: ((text: string) => void) | undefined) => {
+				appOnChange = handler;
+			},
+		});
+
+		// Same alias idea for bash mode: a leading `！` (Shift+1 in Chinese
+		// mode) must execute exactly like `!`. The `onChange` rewrite above
+		// already flips `state.lines` in place, so by submit time there is
+		// usually nothing left to do — but text that arrives without a change
+		// notification (or a race between the last keystroke and Enter) would
+		// still reach pi core as `！cmd` and miss its `startsWith("!")` check.
+		// Shadowing `onSubmit` closes that gap: the app handler always sees
+		// the canonical `!`/`!!` prefix, while history keeps the canonical form.
+		let appOnSubmit: ((text: string) => unknown) | undefined;
+		const submitHook = (text: string): unknown => {
+			const next = normalizeBashSubmitText(text);
+			return appOnSubmit?.call(this, next);
+		};
+		Object.defineProperty(this, "onSubmit", {
+			configurable: true,
+			enumerable: true,
+			get: () => submitHook,
+			set: (handler: ((text: string) => unknown) | undefined) => {
+				appOnSubmit = handler;
+			},
+		});
 
 		// Re-open the `$skill` picker when the caret lands on a `$token`.
 		// pi refreshes an *open* picker on cursor movement, but never re-triggers
@@ -659,6 +996,75 @@ export class CodexComposer extends CustomEditor {
 			baseMoveCursor.call(this, deltaLine, deltaCol);
 			this.probeSkillAutocomplete();
 		};
+	}
+
+	/**
+	 * Swap a fullwidth mention sigil for the canonical `$` the instant the token
+	 * under it names an indexed skill — `￥coss` becomes `$coss` as the last `s`
+	 * is typed, with the caret untouched. The rewrite is one code unit for one,
+	 * on the same line, at the same offsets, so cursor position, visual layout
+	 * and every other rule (highlight, completion, submit) stay byte-for-byte
+	 * what they were for `$`. Tokens that do not resolve are left alone, so
+	 * `￥100` stays a price and `￥HOME` stays a shell variable; the boundary rule
+	 * is the highlighter's own, so `foo￥coss` is not mangled either.
+	 *
+	 * Returns whether anything changed. Driven from `onChange` (every typed and
+	 * pasted edit) and once per frame from `render()` as a safety net for text
+	 * that arrives without a change notification (programmatic `setText`, draft
+	 * restore, undo) — which also picks up skills added mid-session.
+	 */
+	normalizeMentionSigils(): boolean {
+		if (this.skillIndex.size === 0 && !hasRefetchableRoots(this.skillIndex)) return false;
+		refreshSkillIndexIfStale(this.skillIndex);
+		const editor = this as unknown as { state: { lines: string[] } };
+		const lines = editor.state.lines;
+		let changed = false;
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i]!;
+			if (!hasForeignSigil(line)) continue;
+			const rewritten = line.replace(FOREIGN_SIGIL_TOKEN_RE, (token, offset: number, whole: string) => {
+				if (!isStandaloneTokenStart(whole, offset)) return token;
+				return this.skillIndex.has(token.slice(1).toLowerCase()) ? `$${token.slice(1)}` : token;
+			});
+			if (rewritten !== line) {
+				lines[i] = rewritten;
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
+	/**
+	 * Swap a leading fullwidth bash sigil for the canonical `!` — `！ls`
+	 * becomes `!ls` as soon as the `！` lands, with the caret untouched. The
+	 * rewrite is one code unit for one, on the first content line, at the same
+	 * offsets, so cursor position and every other rule (bash-mode highlight,
+	 * submit, undo, history) stay exactly what they were for `!`. The leading
+	 * run is converted wholesale, so `！！` / `！!` / `!！` all become `!!`
+	 * (excluded from context), mirroring pi core's `!` vs `!!` split. Only the
+	 * first non-blank line's leading run is touched, so a mid-text `！` (Chinese
+	 * punctuation like `你好！`) is never mangled.
+	 *
+	 * Returns whether anything changed. Driven from `onChange` (every typed and
+	 * pasted edit) and once per frame from `render()` as a safety net for text
+	 * that arrives without a change notification (programmatic `setText`, draft
+	 * restore, undo) — the same pattern as `normalizeMentionSigils`.
+	 */
+	normalizeBashSigil(): boolean {
+		const editor = this as unknown as { state: { lines: string[] } };
+		const lines = editor.state.lines;
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i]!;
+			if (line.trim() === "") continue;
+			// First content line: normalise its leading `!`/`！` run, if foreign.
+			const m = /^(\s*)([!！]+)/.exec(line);
+			if (!m || !m[2]!.includes(BASH_FOREIGN_SIGIL)) return false;
+			const prefix = m[1]!;
+			const run = m[2]!;
+			lines[i] = prefix + run.replace(/！/g, BASH_SIGIL) + line.slice(prefix.length + run.length);
+			return true;
+		}
+		return false;
 	}
 
 	/**
@@ -718,6 +1124,12 @@ export class CodexComposer extends CustomEditor {
 	}
 
 	override render(width: number): string[] {
+		// Normalise before the rows are produced, so a `￥token` / leading `！`
+		// that never went through `onChange` still renders (and behaves) as a
+		// plain `$token` / `!` command.
+		this.normalizeMentionSigils();
+		this.normalizeBashSigil();
+
 		// Cursor-movement fallback: probe once per frame so the picker re-opens
 		// on every caret path (including Home/End and page scroll that bypass
 		// moveCursor). No-op while a picker is open or the probe key is unchanged.
@@ -748,7 +1160,9 @@ export class CodexComposer extends CustomEditor {
 		// When the input starts with `!` (bash mode), pi highlights the editor
 		// border with the `bashMode` theme color (green). Since we replaced the
 		// border with a filled panel, we highlight the `❯` prompt instead.
-		const isBashMode = this.getText().trimStart().startsWith("!");
+		// `isBashModeText` also accepts the `！` alias, so the prompt lights up
+		// even on the very first frame before the in-place rewrite lands.
+		const isBashMode = isBashModeText(this.getText());
 		const prompt = isBashMode
 			? this.piTheme.fg("bashMode", this.piTheme.bold(PROMPT_CHAR))
 			: this.piTheme.bold(PROMPT_CHAR);
@@ -783,7 +1197,8 @@ export default function (pi: ExtensionAPI) {
 		const theme = ctx.ui.theme;
 		// Index the four skill formats (agents standard / codex / claude / pi)
 		// for this session's working directory, including project-local roots.
-		const skillIndex = buildSkillIndex(ctx.cwd);
+		// Refetchable: new skills added mid-session show up without `/reload`.
+		const skillIndex = createRefetchableSkillIndex(ctx.cwd);
 		ctx.ui.setEditorComponent((tui, editorTheme, keybindings) => {
 			return new CodexComposer(tui, editorTheme, keybindings, theme, skillIndex);
 		});

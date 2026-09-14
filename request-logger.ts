@@ -1,6 +1,7 @@
-import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ============================================================
@@ -138,6 +139,183 @@ function sanitizeUrl(url: string): string {
 
 function sanitizeError(msg: string): string {
   return msg.replace(/(sk-|tp-)[a-zA-Z0-9_-]{10,}/g, "$1***");
+}
+
+/**
+ * Decode a provider request body for logging.
+ *
+ * Many providers (e.g. workbuddy-cn) send gzip-compressed JSON in fetch's
+ * `body`, so we need to decompress before we can log the full request body.
+ * Returns a UTF-8 string when the body can be decoded, otherwise null.
+ */
+function decodeProviderBody(
+  body: unknown,
+  headers: Record<string, string>,
+): string | null {
+  if (body == null) return null;
+  try {
+    let buf: Buffer;
+    if (typeof body === "string") {
+      buf = Buffer.from(body, "utf-8");
+    } else if (body instanceof ArrayBuffer) {
+      buf = Buffer.from(body);
+    } else if (ArrayBuffer.isView(body)) {
+      buf = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+    } else {
+      return null;
+    }
+
+    const encoding = (headers["Content-Encoding"] ?? headers["content-encoding"] ?? "").toLowerCase();
+    if (encoding.includes("gzip")) {
+      buf = gunzipSync(buf);
+    } else if (encoding.includes("br")) {
+      buf = brotliDecompressSync(buf);
+    } else if (encoding.includes("deflate")) {
+      buf = inflateSync(buf);
+    }
+
+    return buf.toString("utf-8");
+  } catch {
+    return null;
+  }
+}
+
+/** Pretty-print JSON bodies when possible, otherwise keep the raw text. */
+function formatFullBody(raw: string): string {
+  try {
+    const parsed = JSON.parse(raw);
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+// ============================================================
+// Redaction: strip dialogue content, keep structure/sizes
+// ============================================================
+function redactMessage(m: any): any {
+  if (!m || typeof m !== "object") return m;
+  const role = m.role;
+  if (role === "user") {
+    const c = m.content;
+    if (typeof c === "string") {
+      return { role, content: `[REDACTED user len=${c.length}]`, timestamp: m.timestamp, _meta: { contentChars: c.length } };
+    }
+    if (Array.isArray(c)) {
+      let total = 0;
+      const redacted = c.map((item: any) => {
+        if (item?.type === "text" && typeof item.text === "string") { total += item.text.length; return { type: "text", len: item.text.length, text: "[REDACTED]" }; }
+        if (item?.type === "image") return { type: "image", mimeType: item.mimeType, bytes: item.data?.length ?? 0, data: "[REDACTED]" };
+        return item;
+      });
+      return { role, content: redacted, timestamp: m.timestamp, _meta: { contentChars: total } };
+    }
+    return { role, content: "[REDACTED]", timestamp: m.timestamp };
+  }
+  if (role === "assistant") {
+    const c = Array.isArray(m.content) ? m.content : [];
+    const redacted = c.map((item: any) => {
+      if (item?.type === "text" && typeof item.text === "string") return { type: "text", len: item.text.length, text: "[REDACTED]" };
+      if (item?.type === "thinking" && typeof item.thinking === "string") return { type: "thinking", len: item.thinking.length, thinking: "[REDACTED]" };
+      if (item?.type === "toolCall") {
+        const args = item.arguments;
+        const keys = args && typeof args === "object" ? Object.keys(args) : [];
+        const bytes = args ? Buffer.byteLength(JSON.stringify(args), "utf-8") : 0;
+        return { type: "toolCall", id: item.id, name: item.name, arguments: `[REDACTED keys=[${keys.join(",")}] bytes=${bytes}]` };
+      }
+      return { type: item?.type, _redacted: true };
+    });
+    return { role, content: redacted, api: m.api, provider: m.provider, model: m.model, timestamp: m.timestamp };
+  }
+  if (role === "toolResult") {
+    const cont = Array.isArray(m.content) ? m.content : [];
+    const totalChars = cont.reduce((sum: number, x: any) => sum + (typeof x?.text === "string" ? x.text.length : 0), 0);
+    const details = m.details ? `[REDACTED keys=${m.details && typeof m.details === "object" ? Object.keys(m.details).join(",") : typeof m.details}]` : undefined;
+    const out: any = { role, toolCallId: m.toolCallId, toolName: m.toolName, isError: m.isError, content: `[REDACTED toolResult len=${totalChars} items=${cont.length}]`, timestamp: m.timestamp };
+    if (details) out.details = details;
+    return out;
+  }
+  return { role: role ? `${role}_redacted` : "unknown", _redacted: true };
+}
+
+function redactGenericMessage(m: any): any {
+  if (!m || typeof m !== "object") return m;
+  const out: any = { ...m };
+  if (typeof m.content === "string") out.content = `[REDACTED len=${m.content.length}]`;
+  else if (Array.isArray(m.content)) out.content = m.content.map((c: any) => typeof c?.text === "string" ? { type: c.type, len: c.text.length, text: "[REDACTED]" } : c);
+  if (Array.isArray(m.tool_calls)) out.tool_calls = `[REDACTED count=${m.tool_calls.length}]`;
+  return out;
+}
+
+function redactGeneric(obj: any, depth = 0): any {
+  if (depth > 4) return "[REDACTED depth]";
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map((v) => redactGeneric(v, depth + 1));
+  const out: any = {};
+  for (const [k, v] of Object.entries(obj)) {
+    const lk = k.toLowerCase();
+    if (["text", "thinking", "content", "arguments", "details", "input", "output", "prompt"].includes(lk) && typeof v === "string") {
+      out[k] = `[REDACTED ${lk} len=${(v as string).length}]`;
+    } else if (lk === "content" && Array.isArray(v)) {
+      out[k] = `[REDACTED content items=${(v as any[]).length}]`;
+    } else if (typeof v === "object" && v !== null) {
+      out[k] = redactGeneric(v, depth + 1);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function redactPayload(parsed: any): any {
+  if (!parsed || typeof parsed !== "object") return parsed;
+  if (parsed.context && typeof parsed.context === "object") {
+    const redacted: any = { ...parsed };
+    const ctx: any = { ...parsed.context };
+    if (typeof ctx.systemPrompt === "string") {
+      ctx.systemPrompt = `[REDACTED systemPrompt chars=${ctx.systemPrompt.length}]`;
+    }
+    if (Array.isArray(ctx.messages)) {
+      ctx.messages = ctx.messages.map(redactMessage);
+      ctx._meta = { messageCount: ctx.messages.length };
+    }
+    if (Array.isArray(ctx.tools)) {
+      ctx.tools = ctx.tools.map((t: any) => ({
+        name: t.name,
+        description: typeof t.description === "string" ? t.description.slice(0, 80) : t.description,
+        parametersKeys: t.parameters?.properties ? Object.keys(t.parameters.properties) : undefined,
+        parametersBytes: t.parameters ? Buffer.byteLength(JSON.stringify(t.parameters), "utf-8") : 0,
+      }));
+    }
+    redacted.context = ctx;
+    redacted._meta = { redacted: true, originalChars: JSON.stringify(parsed).length };
+    return redacted;
+  }
+  if (Array.isArray(parsed.messages)) {
+    const redacted: any = { ...parsed };
+    redacted.messages = parsed.messages.map(redactGenericMessage);
+    redacted._meta = { redacted: true, messageCount: parsed.messages.length };
+    if (Array.isArray(parsed.tools)) {
+      redacted.tools = parsed.tools.map((t: any) => ({ name: t?.function?.name ?? t?.name, description: t?.function?.description?.slice(0, 80) }));
+    }
+    return redacted;
+  }
+  return redactGeneric(parsed);
+}
+
+// ============================================================
+// Per-session request log path builder
+//
+// Derives the request-log filename from the pi session file so it stays
+// in lockstep with the session (same timestamp/id). Used by session_start
+// to create currentLogFile before any provider request is logged.
+// ============================================================
+
+function buildRequestLogPath(sessionFile: string | undefined, sessionId: string | undefined): string {
+  const base = sessionFile
+    ? basename(sessionFile, ".jsonl")
+    : `${new Date().toISOString().replace(/[:.]/g, "-")}_${sessionId ?? "unknown"}`;
+  return join(REQUESTS_DIR, SESSION_DIR_NAME, `requests-${base}.log`);
 }
 
 // ============================================================
@@ -422,6 +600,230 @@ function wrapStreamForDebug(response: Response, seq: number): Response {
 }
 
 // ============================================================
+// Response usage / cache capture (always on)
+//
+// For 2xx streaming responses (SSE) the body is consumed by the provider
+// SDK, so we can't read it without breaking the stream. Instead we tee the
+// stream via a wrapping ReadableStream (same pattern as wrapStreamForDebug):
+// each chunk is forwarded byte-identical while we scan complete SSE lines
+// for usage/cache fields. The captured usage is appended to the request's
+// RESPONSE log block after the stream closes, recording only token/cache
+// counts — never dialogue content (matches the request-side redaction).
+//
+// Disabled with REQUEST_LOG_USAGE=0. Covers any provider whose responses
+// pass through globalThis.fetch with Content-Type text/event-stream or a
+// JSON body (OpenAI Responses/Completions, Anthropic, Mistral, WorkBuddy,
+// Google via its SDK's fetch, ...). Providers that bypass fetch (e.g. AWS
+// Bedrock SDK) won't be captured here — their usage still reaches pi via the
+// provider's own stream and is recorded in the session file.
+// ============================================================
+const CAPTURE_USAGE = process.env.REQUEST_LOG_USAGE !== "0";
+
+// Known token/cache field names across providers (union; we record whichever
+// the backend actually returns, so missing-field diagnostics are visible).
+// OpenAI Responses: usage.{input_tokens,output_tokens,total_tokens,
+//   input_tokens_details.{cached_tokens,cache_write_tokens},
+//   output_tokens_details.reasoning_tokens}
+// OpenAI Completions: usage.{prompt_tokens,completion_tokens,total_tokens,
+//   cached_tokens,prompt_cache_hit_tokens,
+//   prompt_tokens_details.{cached_tokens,cache_write_tokens},
+//   completion_tokens_details.reasoning_tokens}
+// Anthropic: usage.{input_tokens,output_tokens,cache_read_input_tokens,
+//   cache_creation_input_tokens,cache_creation.ephemeral_1h_input_tokens,
+//   output_tokens_details.thinking_tokens}
+// Mistral: usage.{prompt_tokens,completion_tokens,prompt_tokens_details.cachedTokens}
+// Google: usageMetadata.{promptTokenCount,candidatesTokenCount,
+//   cachedContentTokenCount,thoughtsTokenCount,totalTokenCount}
+// Bedrock: usage.{inputTokens,outputTokens,totalTokens,
+//   cacheReadInputTokens,cacheWriteInputTokens}
+// WorkBuddy: usage.{prompt_tokens,completion_tokens,total_tokens,
+//   prompt_cache_hit_tokens,prompt_cache_write_tokens,
+//   cache_creation_input_tokens}
+const USAGE_FIELD_KEYS = new Set([
+  // raw token totals
+  "prompt_tokens", "completion_tokens", "total_tokens",
+  "input_tokens", "output_tokens", "inputTokens", "outputTokens", "totalTokens",
+  "promptTokenCount", "candidatesTokenCount", "thoughtsTokenCount", "totalTokenCount",
+  // cache read (hits)
+  "cached_tokens", "prompt_cache_hit_tokens", "cache_read_input_tokens",
+  "cacheReadInputTokens", "cachedContentTokenCount",
+  // cache write (creation)
+  "cache_write_tokens", "prompt_cache_write_tokens", "cache_creation_input_tokens",
+  "cacheWriteInputTokens",
+  // cache write split (Anthropic 1h)
+  "cache_creation",
+  "ephemeral_1h_input_tokens",
+  // reasoning/thinking
+  "reasoning_tokens", "thinking_tokens",
+  // nested detail containers (kept so the raw dump shows their presence)
+  "input_tokens_details", "output_tokens_details", "prompt_tokens_details",
+  "completion_tokens_details", "promptTokensDetails",
+]);
+
+/** True if a parsed SSE data object plausibly carries usage/cache info. */
+function hasUsageSignal(obj: unknown): boolean {
+  if (!obj || typeof obj !== "object") return false;
+  // Direct usage block: { usage: {...} } (OpenAI/Anthropic/Mistral/WorkBuddy)
+  const usage = (obj as { usage?: unknown }).usage;
+  if (usage && typeof usage === "object") return true;
+  // Google: top-level usageMetadata
+  if ((obj as { usageMetadata?: unknown }).usageMetadata) return true;
+  // Bedrock: top-level metadata.usage
+  const meta = (obj as { metadata?: { usage?: unknown } }).metadata;
+  if (meta && typeof meta === "object" && (meta as { usage?: unknown }).usage) return true;
+  // OpenAI Responses response.completed carries response.usage
+  const resp = (obj as { response?: { usage?: unknown } }).response;
+  if (resp && typeof resp === "object" && (resp as { usage?: unknown }).usage) return true;
+  return false;
+}
+
+/**
+ * Flatten an object's numeric/leaf fields into {path: value} pairs, limited
+ * to usage/cache-relevant keys. Returns the minimal projection so the log
+ * line stays compact and content-free (only counts, never text).
+ */
+function flattenUsage(obj: unknown, prefix = "", out: Record<string, number | string> = {}): Record<string, number | string> {
+  if (!obj || typeof obj !== "object") return out;
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    const path = prefix ? `${prefix}.${k}` : k;
+    if (v != null && typeof v === "object") {
+      // Only descend into known detail containers (avoid dumping arbitrary
+      // nested content — keeps the projection to token counts only).
+      if (USAGE_FIELD_KEYS.has(k) || k === "usage" || k === "usageMetadata" || k === "metadata" || k === "response") {
+        flattenUsage(v, path, out);
+      }
+      continue;
+    }
+    if (USAGE_FIELD_KEYS.has(k) && (typeof v === "number" || typeof v === "string")) {
+      out[path] = v;
+    }
+  }
+  return out;
+}
+
+/** Format the captured usage projection as compact `key=value` log lines. */
+function formatCapturedUsage(flat: Record<string, number | string>): string {
+  if (Object.keys(flat).length === 0) return "";
+  const entries = Object.entries(flat)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`);
+  return entries.join(", ");
+}
+
+/**
+ * Wrap a 2xx response so its SSE/JSON body is teed for usage capture without
+ * breaking the consumer's stream. Mirrors wrapStreamForDebug's pull-based
+ * ReadableStream + Proxy pattern (highWaterMark:0 so the body is only locked
+ * on first read). Scans complete `data:` lines; on stream close, appends a
+ * `USAGE` log block with the last seen usage projection + raw JSON dump.
+ */
+function wrapStreamForUsage(response: Response, requestTs: string, model: string): Response {
+  try {
+    if (!response.body) return response;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+    // One persistent decoder across chunks: decode(..., { stream: true }) carries
+    // unfinished multi-byte UTF-8 sequences between reads, so non-ASCII content
+    // (e.g. CJK dialogue) survives chunk boundaries in the scanned text. The
+    // forwarded bytes are untouched — only the scan path sees decoded text.
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let lastFlat: Record<string, number | string> = {};
+    let lastRaw: unknown = null;       // last usage-bearing chunk (raw)
+    let rawBytes = 0;
+    let sawUsage = false;
+
+    const wrapped = new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          try {
+            reader ??= response.body!.getReader();
+            const { done, value } = await reader.read();
+            if (done) {
+              // Flush any trailing buffered line.
+              if (buffer.trim()) scanLine(buffer);
+              buffer = "";
+              if (sawUsage) {
+                appendUsageLog(requestTs, model, lastFlat, lastRaw, rawBytes);
+              }
+              controller.close();
+              return;
+            }
+            rawBytes += value.byteLength;
+            buffer += decoder.decode(value, { stream: true });
+            // Process complete lines, keep the trailing partial in buffer.
+            let nl: number;
+            while ((nl = buffer.indexOf("\n")) !== -1) {
+              const line = buffer.slice(0, nl);
+              buffer = buffer.slice(nl + 1);
+              scanLine(line);
+            }
+            controller.enqueue(value);
+          } catch (err) {
+            // Still try to log what we captured before the error.
+            if (sawUsage) {
+              try { appendUsageLog(requestTs, model, lastFlat, lastRaw, rawBytes); } catch { /* ignore */ }
+            }
+            controller.error(err);
+          }
+        },
+        cancel(reason) {
+          reader?.cancel(reason).catch(() => {});
+        },
+      },
+      { highWaterMark: 0 },
+    );
+
+    function scanLine(line: string): void {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) return;
+      const dataStr = trimmed.slice(5).trim();
+      if (!dataStr || dataStr === "[DONE]") return;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(dataStr);
+      } catch {
+        return; // not JSON SSE (some providers send plain frames)
+      }
+      if (!hasUsageSignal(parsed)) return;
+      sawUsage = true;
+      lastRaw = parsed;
+      lastFlat = flattenUsage(parsed);
+    }
+
+    return new Proxy(response, {
+      get(target, prop) {
+        if (prop === "body") return wrapped;
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+  } catch {
+    return response;
+  }
+}
+
+/** Append the captured usage block to the log (compact, content-free). */
+function appendUsageLog(requestTs: string, model: string, flat: Record<string, number | string>, raw: unknown, rawBytes: number): void {
+  const usageLine = formatCapturedUsage(flat);
+  // Dump the raw usage-bearing chunk too, so field-name mismatches (e.g. a
+  // backend returning an undocumented cache-write field) are visible. Truncate
+  // the JSON to keep the log bounded; usage chunks are tiny (<2KB typically).
+  let rawDump = "";
+  try {
+    rawDump = JSON.stringify(raw);
+  } catch {
+    rawDump = "(unserializable)";
+  }
+  if (rawDump.length > 4096) rawDump = rawDump.slice(0, 4096) + "\u2026";
+  appendLog(
+    `[${requestTs}] USAGE ${model} (stream ${fmtBytes(rawBytes)}, ${usageLine ? "captured" : "no-usage-field"})` +
+    (usageLine ? `\n│ ${usageLine}` : "") +
+    `\n│ raw: ${rawDump}` +
+    `\n└─`,
+  );
+}
+
+// ============================================================
 // TUI notification for non-2xx provider errors
 // ============================================================
 let _tuiCtx: ExtensionContext | null = null;
@@ -533,73 +935,31 @@ if (typeof _underlyingFetch === "function") {
             .map(([k, v]) => `    ${k.padEnd(24)} ${v}`)
             .join("\n");
 
-          // Build request-body section
+          // Build request-body section: REDACTED — strip dialogue, keep counts/sizes.
           let bodySection = "";
-          if (init?.body && typeof init.body === "string") {
+          const rawBody = decodeProviderBody(init?.body, headers);
+          if (rawBody) {
+            const decodedSize = Buffer.byteLength(rawBody, "utf-8");
+            let formatted: string;
+            let redactedSize = decodedSize;
+            let metaNote = "";
             try {
-              const parsed = JSON.parse(init.body) as Record<string, unknown>;
-              const bodyEntries: [string, string][] = [];
-
-              const modelVal = parsed.model || payload?.model || "";
-              if (modelVal) bodyEntries.push(["model", String(modelVal)]);
-
-              if (Array.isArray(parsed.messages)) {
-                const rawMsgs = parsed.messages as Array<Record<string, unknown>>;
-                const totalChars = rawMsgs.reduce((s, m) => {
-                  const c = m?.content;
-                  if (typeof c === "string") return s + c.length;
-                  if (Array.isArray(c)) return s + JSON.stringify(c).length;
-                  return s;
-                }, 0);
-                bodyEntries.push(["messages", `≈${fmtBytes(totalChars)}`]);
-              }
-
-              // --- Reasoning / thinking parameters ---
-
-              // OpenAI / DeepSeek: reasoning_effort at top level
-              if (parsed.reasoning_effort) {
-                bodyEntries.push(["reasoning_effort", String(parsed.reasoning_effort)]);
-              }
-
-
-
-              // Anthropic / MIMO / DeepSeek (via extra_body): thinking object
-              if (parsed.thinking && typeof parsed.thinking === "object") {
-                const t = parsed.thinking as Record<string, unknown>;
-                if (t.type) bodyEntries.push(["thinking.type", String(t.type)]);
-              }
-
-              // Anthropic / DeepSeek (Anthropic endpoint): output_config.effort
-              if (parsed.output_config && typeof parsed.output_config === "object") {
-                const oc = parsed.output_config as Record<string, unknown>;
-                if (oc.effort) bodyEntries.push(["output_config.effort", String(oc.effort)]);
-              }
-
-              // Remaining keys summary (replaces the old "… …" placeholder)
-              const shownKeys = new Set([
-                "model", "messages",
-                "reasoning_effort",
-                "thinking", "output_config",
-                "system", "tools", "tool_choice", "stop",
-                "temperature", "top_p",
-                "frequency_penalty", "presence_penalty",
-                "response_format", "seed", "user", "n",
-                "metadata", "store", "service_tier",
-              ]);
-              const otherKeys = Object.keys(parsed).filter(k => !shownKeys.has(k));
-              if (otherKeys.length > 0) {
-                bodyEntries.push(["…", `${otherKeys.length} keys`]);
-              }
-
-              if (bodyEntries.length > 0) {
-                bodySection = `│ body:\n` +
-                  bodyEntries.map(([k, v]) => `    ${k.padEnd(24)} ${v}`).join("\n");
-              }
+              const parsed = JSON.parse(rawBody);
+              const redacted = redactPayload(parsed);
+              formatted = JSON.stringify(redacted, null, 2);
+              redactedSize = Buffer.byteLength(formatted, "utf-8");
+              const msgCount = (redacted as any)?.context?.messages?.length ?? (redacted as any)?.messages?.length;
+              const toolCount = (redacted as any)?.context?.tools?.length ?? (redacted as any)?.tools?.length;
+              const parts: string[] = [];
+              if (msgCount !== undefined) parts.push(`${msgCount} msgs`);
+              if (toolCount !== undefined) parts.push(`${toolCount} tools`);
+              if (parts.length) metaNote = `, ${parts.join(", ")}`;
             } catch {
-              if (bodySize > 0) {
-                bodySection = `│ body:\n    body_size                ${fmtBytes(bodySize)}`;
-              }
+              formatted = `[REDACTED non-JSON body ${fmtBytes(decodedSize)}]`;
+              redactedSize = Buffer.byteLength(formatted, "utf-8");
             }
+            bodySection = `│ body (redacted, ${fmtBytes(decodedSize)} -> ${fmtBytes(redactedSize)}${metaNote}):\n` +
+              formatted.split("\n").map((l) => `    ${l}`).join("\n");
           } else if (bodySize > 0) {
             bodySection = `│ body:\n    body_size                ${fmtBytes(bodySize)}`;
           }
@@ -713,17 +1073,40 @@ if (typeof _underlyingFetch === "function") {
               }
             }
 
+            // For 2xx streaming responses, hint that usage will be captured
+            // when the stream closes (the USAGE block is appended later).
+            let usageHint = "";
+            if (response.status >= 200 && response.status < 300 && CAPTURE_USAGE) {
+              const ct = respHeaders["content-type"] || respHeaders["Content-Type"] || "";
+              if (ct.includes("event-stream") || ct.includes("json") || ct.includes("text/")) {
+                usageHint = `\n│ usage: (capturing from stream — appended on close)`;
+              }
+            }
+
             appendLog(
               `[${ts}] RESPONSE ${response.status} (ttfb ${ttfbStr}s)` +
               `\n│ header:\n${rhLines}` +
               bodySection +
+              usageHint +
               `\n└─`
             );
           }
 
-          // Debug-only: wrap the stream to record chunk timing for in-flight
-          // requests. Non-debug responses pass through untouched.
-          if (DEBUG && isProviderReq && !isDuplicate) {
+          // Wrap the response stream for in-flight diagnostics / usage capture.
+          // Both wrappers are pull-based tees (highWaterMark:0) that forward
+          // every byte untouched, so they compose safely when chained:
+          //   2xx non-DEBUG:  wrapStreamForUsage   (usage/cache capture, always on)
+          //   2xx DEBUG:      wrapStreamForUsage → wrapStreamForDebug (usage + timing)
+          //   non-2xx DEBUG:  wrapStreamForDebug  (timing only)
+          // The always-on stall monitor only needs headers, so it works either way.
+          if (isProviderReq && !isDuplicate && response.status >= 200 && response.status < 300) {
+            if (CAPTURE_USAGE && response.body) {
+              response = wrapStreamForUsage(response, ts, payload?.model ?? "?");
+            }
+            if (DEBUG) {
+              response = wrapStreamForDebug(response, seq);
+            }
+          } else if (DEBUG && isProviderReq && !isDuplicate) {
             response = wrapStreamForDebug(response, seq);
           }
 
@@ -811,11 +1194,10 @@ export default function (pi: ExtensionAPI): void {
     if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
 
     // 优先从 session 文件派生；临时/内存会话无文件时回退为手工拼接
-    const sessionFile = ctx.sessionManager.getSessionFile();
-    const base = sessionFile
-      ? basename(sessionFile, ".jsonl")
-      : `${new Date().toISOString().replace(/[:.]/g, "-")}_${ctx.sessionManager.getSessionId()}`;
-    currentLogFile = join(sessionDir, `requests-${base}.log`);
+    currentLogFile = buildRequestLogPath(
+      ctx.sessionManager.getSessionFile(),
+      ctx.sessionManager.getSessionId(),
+    );
 
     appendLog(`[${new Date().toISOString()}] SESSION START (session_id=${ctx.sessionManager.getSessionId()}, cwd=${CWD})`);
     if (DEBUG) {

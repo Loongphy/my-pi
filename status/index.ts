@@ -8,8 +8,10 @@
  *   - Turn duration display
  *   - Auto conversation title generation
  *   - Status header widget replacing footer (header.ts)
+ *   - Passive footer slot host: renders ctx.ui.setStatus() text from other
+ *     extensions, staying invisible while nobody has published anything
  *
- * Hides the built-in footer to avoid duplication.
+ * Hides the built-in footer to avoid duplication (see installFooterSlots).
  */
 
 import fs from "node:fs";
@@ -145,12 +147,49 @@ function createInitialState(): AppState {
   };
 }
 
-// ── Empty footer (hides pi's built-in footer) ──
+// ── Footer slot host ────────────────────────────────────────────────────────
+//
+// This extension draws its own status header, so pi's built-in footer is
+// suppressed. That also swallowed `ctx.ui.setStatus()` text published by other
+// extensions (429-retry, session-workbench, ...), which had nowhere to render.
+//
+// Instead of an always-empty footer, publish a passive slot area:
+//   * render every status other extensions have set via ctx.ui.setStatus()
+//   * collapse to zero lines when nobody has published anything
+//
+// The footer therefore stays invisible by default (unchanged behaviour) and
+// only appears when some plugin opts in — no per-plugin configuration needed.
+// Ordering follows Map insertion order; set a status to undefined to leave.
 
-const emptyFooter = () => ({
-  render: () => [] as string[],
-  invalidate: () => {},
-});
+const FOOTER_SLOT_SEPARATOR = " · ";
+const FOOTER_SLOT_KEYS = Symbol.for("pi.status.footerSlotKeys") as symbol;
+
+/**
+ * Optional allow/deny list for footer slots, read from the statusline config:
+ *   { "footerSlots": { "hide": ["session-workbench"], "only": [] } }
+ * Leave unset to show everything. `only` (when non-empty) wins over `hide`.
+ */
+function footerSlotFilter(config: StatusLineConfig | undefined): (key: string) => boolean {
+  const slots = (config as { footerSlots?: { hide?: string[]; only?: string[] } } | undefined)?.footerSlots;
+  const only = slots?.only?.length ? new Set(slots.only) : null;
+  const hide = new Set(slots?.hide ?? []);
+  return (key: string) => (only ? only.has(key) : !hide.has(key));
+}
+
+function installFooterSlots(ctx: ExtensionContext, allow: (key: string) => boolean): void {
+  ctx.ui.setFooter((_tui, theme: Theme, footerData) => ({
+    invalidate: () => {},
+    render(width: number): string[] {
+      const parts: string[] = [];
+      for (const [key, text] of footerData.getExtensionStatuses()) {
+        if (!text || !allow(key)) continue;
+        parts.push(text);
+      }
+      if (parts.length === 0) return [];
+      return [truncateToWidth(parts.join(theme.fg("dim", FOOTER_SLOT_SEPARATOR)), width)];
+    },
+  }));
+}
 
 // ── Helpers ──
 
@@ -734,8 +773,8 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) return;
 
-    // Hide built-in footer
-    ctx.ui.setFooter(emptyFooter);
+    // Passive footer slot area: invisible until some plugin publishes a status.
+    installFooterSlots(ctx, footerSlotFilter(configRef.current));
 
     state.isAutoTitling = false;
     state.isRetrying = false;

@@ -321,16 +321,46 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
+   * Extract body.error.message from an opencode.ai 429 body for passthrough.
+   * Single-line + truncated, so the retry line shows the real upstream reason.
+   * opencode-only: other providers keep the generic warning.
+   */
+  function extractOpencodeDetail(body: string): string | undefined {
+    try {
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      const err = (parsed?.error ?? parsed) as Record<string, unknown>;
+      const msg = err?.message;
+      if (typeof msg !== "string" || !msg.trim()) return undefined;
+      const oneLine = msg.replace(/\s+/g, " ").trim();
+      return oneLine.length > 220 ? oneLine.slice(0, 220) + "..." : oneLine;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function getOpencodeDetail(response: Response, url: string): Promise<string | undefined> {
+    if (!/opencode\.ai/i.test(url)) return undefined;
+    try {
+      const body = await response.clone().text();
+      return extractOpencodeDetail(body);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Single live countdown line in the CHAT area (the position the old
    * per-retry warnings used). Consecutive "info" notifies update the SAME
    * line in place (pi's showStatus mechanism), so we get one changing line
    * instead of one line per retry. The "Warning: " prefix keeps it looking
    * like the original warning; the color is dim because warning-type
    * notifications always append a new line and cannot be updated in place.
+   * detail is the passthrough body.error.message for opencode 429s.
    */
-  function setRateLimitLine(remainingSec: number, attempt: number): void {
+  function setRateLimitLine(remainingSec: number, attempt: number, detail?: string): void {
+    const suffix = detail ? ` - ${detail}` : "";
     _ctx?.ui?.notify?.(
-      `Warning: Received 429 (Too Many Requests) - retry ${attempt}/${MAX_RETRIES} in ${remainingSec}s; disable with /429-retry off`,
+      `Warning: Received 429 (Too Many Requests) - retry ${attempt}/${MAX_RETRIES} in ${remainingSec}s; disable with /429-retry off${suffix}`,
       "info"
     );
   }
@@ -343,7 +373,6 @@ export default function (pi: ExtensionAPI) {
     isRateLimited = false;
     retryCount = 0;
     lastRateLimitTime = null;
-    _ctx?.ui?.setStatus?.("429-retry", undefined);
   }
 
   /**
@@ -548,14 +577,11 @@ export default function (pi: ExtensionAPI) {
         // (resets_at + error.message suffix) is opencode-only; other
         // providers keep the historical top-level resets_in.
         const annotated = await annotateResetTime(response, serverWaitMs, rule?.name === "opencode");
-        const theme = _ctx?.ui?.theme;
-        if (theme) {
-          _ctx?.ui?.setStatus?.(
-            "429-retry",
-            theme.fg("dim", rule
-              ? `429 handled by ${rule.name} - surfacing error (no retry)`
-              : "Rate limit reset window too long (>10m) - surfacing error (no retry)")
-          );
+        const opencodeDetail = await getOpencodeDetail(response, url);
+        // opencode 429: passthrough body.error.message to chat so the real
+        // upstream reason stays visible even when the SDK only shows a code.
+        if (opencodeDetail) {
+          _ctx?.ui?.notify?.(`429 ${opencodeDetail}`, "warning");
         }
         isRateLimited = false;
         // If the user aborted while we were annotating / deciding ownership,
@@ -582,16 +608,20 @@ export default function (pi: ExtensionAPI) {
       let actualWaitMs = Math.max(rawWaitMs, 1000);
       actualWaitMs = Math.min(actualWaitMs, HARD_LIMIT_WAIT_MS);
 
+      // opencode 429: passthrough body.error.message so the retry line shows
+      // the real upstream reason instead of a generic 429.
+      const retryDetail = await getOpencodeDetail(response, url);
+
       // Single live countdown line in the chat area: shows the concrete wait
       // for THIS attempt and counts it down in place every second - no
       // per-retry warning lines.
-      setRateLimitLine(Math.ceil(actualWaitMs / 1000), attempts);
+      setRateLimitLine(Math.ceil(actualWaitMs / 1000), attempts, retryDetail);
 
       const endTime = Date.now() + actualWaitMs;
       while (Date.now() < endTime) {
         const remainingSec = Math.ceil((endTime - Date.now()) / 1000);
         if (remainingSec <= 0) break;
-        setRateLimitLine(remainingSec, attempts);
+        setRateLimitLine(remainingSec, attempts, retryDetail);
         // Aborted (Esc / Ctrl+C): stop retrying immediately and surface a
         // real abort to the SDK (reject, do NOT resolve with the 429 response).
         if (signal?.aborted) {
@@ -614,18 +644,6 @@ export default function (pi: ExtensionAPI) {
     if (isRateLimited && response.status !== 429) {
       isRateLimited = false;
       retryCount = 0;
-      _ctx?.ui?.setStatus?.("429-retry", undefined);
-    }
-
-    // If still 429 after the maximum retry count
-    if (response.status === 429 && attempts >= MAX_RETRIES) {
-      const theme = _ctx?.ui?.theme;
-      if (theme) {
-        _ctx?.ui?.setStatus?.(
-          "429-retry",
-          theme.fg("dim", `Rate limit persists after ${MAX_RETRIES} retries`)
-        );
-      }
     }
 
     return response;
@@ -669,7 +687,6 @@ export default function (pi: ExtensionAPI) {
     retryCount = 0;
     lastAbortAt = null;
     lastAbortUrl = null;
-    _ctx?.ui?.setStatus?.("429-retry", undefined);
   }
 
   // Enable the wrapper on init
@@ -679,7 +696,6 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("429-retry", {
     description: "Toggle 429 retry or set wait time (e.g. /429-retry 30)",
     handler: async (args, ctx) => {
-      const theme = ctx.ui.theme;
       const arg = args?.trim().toLowerCase();
 
       // Parse args: a number sets the wait time
@@ -688,10 +704,6 @@ export default function (pi: ExtensionAPI) {
         if (seconds > 0) {
           customWaitMs = seconds * 1000;
           ctx.ui.notify(`429 retry wait time set to ${seconds}s`, "info");
-          ctx.ui.setStatus(
-            "429-retry",
-            theme.fg("dim", `429 retry: ${enabled ? "ON" : "OFF"} (${seconds}s)`)
-          );
         } else {
           ctx.ui.notify("Wait time must be > 0", "error");
         }
@@ -722,31 +734,12 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Update the status bar
-      ctx.ui.setStatus(
-        "429-retry",
-        enabled
-          ? theme.fg("dim", `429 retry: ON (${describeWaitStrategy()})`)
-          : theme.fg("dim", "429 retry: OFF")
-      );
     },
   });
 
   // Initialize the context on session start
   pi.on("session_start", async (_event, ctx) => {
     _ctx = ctx;
-    const theme = ctx.ui.theme;
-    ctx.ui.setStatus(
-      "429-retry",
-      theme.fg("dim", `429 retry: ${enabled ? "ON" : "OFF"} (${describeWaitStrategy()})`)
-    );
-
-    // Hide the initial status after 3 seconds (if not rate limited)
-    setTimeout(() => {
-      if (!isRateLimited) {
-        ctx.ui.setStatus("429-retry", undefined);
-      }
-    }, 3000);
   });
 
   // Listen for provider response events for extra logging
