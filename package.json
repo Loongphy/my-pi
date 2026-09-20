@@ -13,7 +13,8 @@
 		"shortcuts.ts",
 		"429-retry.ts",
 		"status/",
-		"thinking-level.ts"
+		"thinking-level.ts",
+		"session-workbench.ts"
 	],
 	"pi": {
 		"extensions": [
@@ -22,7 +23,8 @@
 			"./shortcuts.ts",
 			"./429-retry.ts",
 			"./status/",
-			"./thinking-level.ts"
+			"./thinking-level.ts",
+			"./session-workbench.ts"
 		]
 	}
 }
