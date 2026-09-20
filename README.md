@@ -30,33 +30,6 @@ How it shows up in pi:
 > [!NOTE]
 > The git clone is managed by pi — updating runs `git clean -fdx` + `git pull`, so **don't edit files inside `~/.pi/agent/git/`**. Keep personal customizations in `~/.pi/agent/extensions/` (loaded alongside packages).
 
-### Legacy — migrating from manual setup
-
-Previously this collection was installed by copying files into `~/.pi/agent/extensions/`. To migrate to the recommended install:
-
-```bash
-pi install https://github.com/Loongphy/my-pi
-```
-
-Then remove the manual copies from `~/.pi/agent/extensions/` (the ones that exist in the package), and run `/reload`.
-
-> [!WARNING]
-> If you keep both, the same extensions load twice — duplicate patches, first-wins tool registration.
-
-<details>
-<summary>Archived: old manual setup (deprecated — for reference only)</summary>
-
-```bash
-git clone https://github.com/Loongphy/my-pi.git /tmp/pi-extensions
-cp -r /tmp/pi-extensions/*.ts ~/.pi/agent/extensions/
-cp -r /tmp/pi-extensions/status/ ~/.pi/agent/extensions/status/
-```
-
-> [!WARNING]
-> Check for filename conflicts. If you already have an extension with the same name in `~/.pi/agent/extensions`, **rename the incoming files** (e.g., `collapse-tools.new.ts`) rather than overwriting your existing ones.
-
-</details>
-
 ## Extensions
 
 ### status
@@ -144,25 +117,11 @@ OpenCode-specific: before an opencode.ai usage-limit 429 is handed back to the S
 
 ### thinking-level
 
-One extension for everything about thinking (reasoning) levels — it both **remembers** your choice per model and **shows** what each model supports.
+![thinking-level /model picker](https://github.com/user-attachments/assets/f29e4266-933a-42c9-a712-e2ee0b75a475)
 
-**Memory.** Remembers the last thinking level per model and restores it automatically when you switch back via `/model`, the model selector, or model cycling. Models without a remembered level are raised to their highest supported level (any of the built-in levels: minimum, low, medium, high, xhigh, max) whenever the current level is below it — so switching from a model that only supports `high` to one that supports `max` lands on `max`, never on the inherited `high`. If the level is already at the new model's ceiling, it stays as-is. Manual changes always update the memory. Priority: remembered level → scoped `--models model:level` → max default.
+Remembers the reasoning level **per model** and defaults each model to its highest supported level.
 
-**/model display.** Shows the levels a model supports right on the name line of pi's built-in `/model` picker, so you can see what a model can do with thinking *before* selecting it:
+- Switching back restores its remembered level; a model without one is raised to its maximum — never inheriting a lower level (a `high`-only model followed by a `max`-capable one lands on `max`). Fallback: scoped `--models model:level`.
+- `/model` lists the levels each model supports, current one highlighted. No commands, no switches.
 
-```
-Model Name: MiMo V2.5 Free · reasoning: off minimal low medium high
-Model Name: Kimi K3 · reasoning: low high max
-Model Name: Qwen3 Coder Next · no reasoning
-```
-
-- The level list comes from pi's own `getSupportedThinkingLevels(model)` — the same function behind the `/thinking` options and the level clamp on switch — so it can never disagree with what pi will actually accept. Models that null out every level (`off` only) read `no reasoning`.
-- The level you are currently on is highlighted in pi's success colour — the same colour as the `Model catalogs refreshed.` line below — but only while the highlighted row *is* the current model. pi exposes no colour API to extensions, so the colour is lifted out of pi's own rendered output (success first, accent as fallback), which keeps it exact for every theme including auto dark/light switching.
-- The extra text reuses the ANSI prefix pi put on that line, so it keeps the theme's muted colour under any theme.
-- `/model` is a built-in interactive command handled before extension commands and before the `input` event, so it cannot be overridden by registering a command of the same name. This extension instead wraps the exported `ModelSelectorComponent.updateList`, which every selection change, search keystroke and catalog refresh goes through. If pi's internals change, the wrapper finds nothing to rewrite and `/model` keeps working untouched.
-
-**No commands, no switches** — install it and both parts just run.
-
-**Storage:** `~/.pi/agent/thinking-level-memory.json` (remembered levels, written automatically as you pick levels)
-
-**File:** `thinking-level.ts` (merged from the former `thinking-level-memory.ts` + `model-reasoning.ts`)
+**Storage:** `~/.pi/agent/thinking-level-memory.json` · **File:** `thinking-level.ts`
