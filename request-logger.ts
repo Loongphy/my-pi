@@ -196,6 +196,29 @@ function formatFullBody(raw: string): string {
 function redactMessage(m: any): any {
   if (!m || typeof m !== "object") return m;
   const role = m.role;
+  // pi >= 0.86 transcript: system messages carry the prompt (`content`,
+  // `sections`) and tool declarations (`toolsAdded`/`toolsRemoved`).
+  if (role === "system") {
+    const c = m.content;
+    const contentChars = typeof c === "string"
+      ? c.length
+      : Array.isArray(c)
+        ? c.reduce((sum: number, x: any) => sum + (typeof x?.text === "string" ? x.text.length : 0), 0)
+        : 0;
+    const out: any = {
+      role,
+      content: `[REDACTED system len=${contentChars}]`,
+      timestamp: m.timestamp,
+    };
+    if (m.sections && typeof m.sections === "object") {
+      out.sections = Object.fromEntries(
+        Object.keys(m.sections).map((k) => [k, `[REDACTED len=${typeof m.sections[k] === "string" ? m.sections[k].length : 0}]`]),
+      );
+    }
+    if (Array.isArray(m.toolsAdded)) out.toolsAdded = m.toolsAdded.map((t: any) => ({ name: t?.name }));
+    if (Array.isArray(m.toolsRemoved)) out.toolsRemoved = m.toolsRemoved.map((t: any) => ({ name: t?.name }));
+    return out;
+  }
   if (role === "user") {
     const c = m.content;
     if (typeof c === "string") {
@@ -272,20 +295,11 @@ function redactPayload(parsed: any): any {
   if (parsed.context && typeof parsed.context === "object") {
     const redacted: any = { ...parsed };
     const ctx: any = { ...parsed.context };
-    if (typeof ctx.systemPrompt === "string") {
-      ctx.systemPrompt = `[REDACTED systemPrompt chars=${ctx.systemPrompt.length}]`;
-    }
+    // TranscriptContext (pi >= 0.86): prompt and tool declarations live in
+    // `messages` as role:"system" entries — redactMessage covers them.
     if (Array.isArray(ctx.messages)) {
       ctx.messages = ctx.messages.map(redactMessage);
       ctx._meta = { messageCount: ctx.messages.length };
-    }
-    if (Array.isArray(ctx.tools)) {
-      ctx.tools = ctx.tools.map((t: any) => ({
-        name: t.name,
-        description: typeof t.description === "string" ? t.description.slice(0, 80) : t.description,
-        parametersKeys: t.parameters?.properties ? Object.keys(t.parameters.properties) : undefined,
-        parametersBytes: t.parameters ? Buffer.byteLength(JSON.stringify(t.parameters), "utf-8") : 0,
-      }));
     }
     redacted.context = ctx;
     redacted._meta = { redacted: true, originalChars: JSON.stringify(parsed).length };
@@ -1217,13 +1231,14 @@ export default function (pi: ExtensionAPI): void {
       dbgLog(`agent_start: prompt="${(event.prompt ?? "").slice(0, 100)}"`);
     });
     pi.on("agent_end", (event) => {
-      const last = event.messages[event.messages.length - 1];
+      const last: any = event.messages[event.messages.length - 1];
       dbgLog(`agent_end: last=${last?.role} stopReason=${last?.stopReason ?? ""} error=${last?.errorMessage ?? ""}`);
     });
     pi.on("agent_settled", () => dbgLog("agent_settled"));
     pi.on("turn_start", (event) => dbgLog(`turn_start: #${event.turnIndex}`));
     pi.on("turn_end", (event) => {
-      dbgLog(`turn_end: #${event.turnIndex} stopReason=${event.message.stopReason ?? ""} error=${event.message.errorMessage ?? ""}`);
+      const m: any = event.message;
+      dbgLog(`turn_end: #${event.turnIndex} stopReason=${m?.stopReason ?? ""} error=${m?.errorMessage ?? ""}`);
     });
     pi.on("message_start", (event) => dbgLog(`message_start: role=${event.message.role}`));
     pi.on("message_update", (event) => {
@@ -1231,12 +1246,12 @@ export default function (pi: ExtensionAPI): void {
       const now = Date.now();
       if (now - _lastMsgUpdateLog >= 5000) {
         _lastMsgUpdateLog = now;
-        const m = event.message;
+        const m: any = event.message;
         dbgLog(`message_update: content=${textLength(m.content)} chars${m.usage ? ` usage=${JSON.stringify(m.usage)}` : ""}`);
       }
     });
     pi.on("message_end", (event) => {
-      const m = event.message;
+      const m: any = event.message;
       dbgLog(`message_end: role=${m.role} stopReason=${m.stopReason ?? ""} error=${m.errorMessage ?? ""}`);
     });
     pi.on("tool_execution_start", (event) => dbgLog(`tool_start: ${event.toolName}`));
