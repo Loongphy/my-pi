@@ -12,6 +12,7 @@
 		"request-logger.ts",
 		"shortcuts.ts",
 		"429-retry.ts",
+		"bash-default-timeout.ts",
 		"status/",
 		"thinking-level.ts",
 		"session-workbench.ts"
@@ -22,6 +23,7 @@
 			"./request-logger.ts",
 			"./shortcuts.ts",
 			"./429-retry.ts",
+			"./bash-default-timeout.ts",
 			"./status/",
 			"./thinking-level.ts",
 			"./session-workbench.ts"
