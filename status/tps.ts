@@ -22,6 +22,14 @@ export class TokenSpeedEngine {
   // Real token count (from message_end usage)
   private _realOutputTokens = 0;
 
+  // Provider-reported timing (message diagnostics, e.g. devin_timing).
+  // When present these replace the engine's own measurements: providers
+  // that flush thinking/tool args in one burst make the decode window
+  // collapse to ~0ms and produce phantom TPS (thousands of tok/s), while
+  // their whole-turn rate is the honest number.
+  private _providerTtftMs: number | undefined;
+  private _providerTps: number | undefined;
+
   // Timing — excludes TTFT for TPS calculation
   private _messageStartTime = 0;
   private _httpRequestStartTime = 0;
@@ -61,6 +69,10 @@ export class TokenSpeedEngine {
    * After first token: returns the frozen measured TTFT.
    */
   get ttftSec(): number {
+    // Provider-authoritative TTFT wins once it is published.
+    if (this._providerTtftMs !== undefined) {
+      return this._providerTtftMs / 1000;
+    }
     // First token has arrived — show the frozen measured value
     if (this._firstTokenArrived) {
       return this._ttftMs / 1000;
@@ -83,6 +95,9 @@ export class TokenSpeedEngine {
    * wall time from generation start (excludes TTFT).
    */
   get tps(): number {
+    // Provider-authoritative TPS wins once it is published.
+    if (this._providerTps !== undefined) return this._providerTps;
+
     // Finished — use real provider-reported tokens (time frozen at finish())
     if (this._finished && this._realOutputTokens > 0) {
       const elapsed = this.elapsedMs;
@@ -139,6 +154,8 @@ export class TokenSpeedEngine {
     this._generationStartTime = 0;
     this._firstTokenArrived = false;
     this._ttftMs = 0;
+    this._providerTtftMs = undefined;
+    this._providerTps = undefined;
     this._tokenTimestamps = [];
     this._windowStartIndex = 0;
   }
@@ -183,15 +200,19 @@ export class TokenSpeedEngine {
   /**
    * Call on message_end (assistant).
    * Injects provider-reported real output token count so the final
-   * status render shows the accurate TPS.
+   * status render shows the accurate TPS. `providerTiming` carries
+   * TTFT/TPS measured inside the provider (message diagnostics) — when
+   * present it replaces our own estimate for the final render.
    */
-  finish(realOutputTokens?: number) {
+  finish(realOutputTokens?: number, providerTiming?: { ttftMs?: number; tps?: number }) {
     this._isStreaming = false;
     this._finished = true;
     this._generationEndTime = Date.now();  // freeze time for stable TPS
     if (realOutputTokens !== undefined && realOutputTokens > 0) {
       this._realOutputTokens = realOutputTokens;
     }
+    this._providerTtftMs = providerTiming?.ttftMs;
+    this._providerTps = providerTiming?.tps;
     // Keep stats alive so the final status render reads real TPS
   }
 
@@ -201,6 +222,8 @@ export class TokenSpeedEngine {
     this._finished = false;
     this._httpRequestStartTime = 0;
     this._generationEndTime = 0;
+    this._providerTtftMs = undefined;
+    this._providerTps = undefined;
     this._tokenTimestamps = [];
     this._windowStartIndex = 0;
   }

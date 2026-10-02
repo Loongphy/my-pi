@@ -965,6 +965,25 @@ export default function (pi: ExtensionAPI) {
 
   // ── Message lifecycle (token speed tracking + widget updates) ──
 
+  /**
+   * Provider-measured turn timing, published as a message diagnostic
+   * (e.g. the devin provider's `devin_timing` entry: ttft_ms / tps).
+   * When present it is more honest than our decode-window estimate for
+   * providers that flush thinking/tool args in one burst.
+   */
+  const providerTimingOf = (message: { diagnostics?: unknown }): { ttftMs?: number; tps?: number } | undefined => {
+    if (!Array.isArray(message.diagnostics)) return undefined;
+    let ttftMs: number | undefined;
+    let tps: number | undefined;
+    for (const d of message.diagnostics as Array<{ details?: Record<string, unknown> }>) {
+      const details = d?.details;
+      if (!details || typeof details !== "object") continue;
+      if (ttftMs === undefined && typeof details.ttft_ms === "number") ttftMs = details.ttft_ms;
+      if (tps === undefined && typeof details.tps === "number") tps = details.tps;
+    }
+    return ttftMs === undefined && tps === undefined ? undefined : { ttftMs, tps };
+  };
+
   pi.on("before_provider_request", async () => {
     state.tokenSpeedEngine.recordHttpRequest();
   });
@@ -1005,7 +1024,10 @@ export default function (pi: ExtensionAPI) {
       clearInterval(state.ttftTimer);
       state.ttftTimer = null;
     }
-    state.tokenSpeedEngine.finish(event.message.usage?.output ?? 0);
+    state.tokenSpeedEngine.finish(
+      event.message.usage?.output ?? 0,
+      providerTimingOf(event.message),
+    );
     immediateUpdate(ctx);
   });
 
