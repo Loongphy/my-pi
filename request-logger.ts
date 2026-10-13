@@ -1228,7 +1228,13 @@ export default function (pi: ExtensionAPI): void {
       dbgLog(`input: "${(event.text ?? "").slice(0, 100)}" (source=${event.source})`);
     });
     pi.on("before_agent_start", (event) => {
-      dbgLog(`agent_start: prompt="${(event.prompt ?? "").slice(0, 100)}"`);
+      // 1.2.0: BeforeAgentStartEvent 是按 messageType 判别的 union。custom 分支是
+      // pi.sendMessage(..., { triggerTurn: true }) 触发的 run，没有 prompt 字段。
+      if (event.messageType === "user") {
+        dbgLog(`agent_start: prompt="${(event.prompt ?? "").slice(0, 100)}"`);
+      } else {
+        dbgLog(`agent_start: custom message (customType=${event.message.customType})`);
+      }
     });
     pi.on("agent_end", (event) => {
       const last: any = event.messages[event.messages.length - 1];
