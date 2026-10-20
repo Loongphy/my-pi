@@ -50,6 +50,9 @@
  * exactly like `!ls` (green `❯`, direct execution), and `！！`/`！!`/`!！` behave
  * like `!!` (excluded from context). Only the leading run is touched, so a
  * `！` anywhere else stays Chinese punctuation (`你好！` is never a command).
+ * The command text itself is tinted with the theme's `bashMode` color, the same
+ * green pi uses for the bash border (and our `❯` prompt), so a `!`/`！` command
+ * reads as one mode instead of only its prompt changing color.
  *
  * Four skill formats are indexed (global + project-local). A skill is any
  * directory containing a SKILL.md (or the skills dir itself holding SKILL.md);
@@ -877,6 +880,26 @@ export function highlightSkillTokens(line: string, index: Map<string, SkillEntry
 	return out;
 }
 
+/**
+ * Tint a whole editor row with the theme's `bashMode` color — the same green
+ * pi paints the editor border with in bash mode, and the same token the `❯`
+ * prompt uses. Bash mode is all-or-nothing (it starts at the first `!` and
+ * applies to the entire input), so unlike a `$skill` mention this colors the
+ * whole row, leading `!`/`!!` included.
+ *
+ * The panel fill runs before this, so the row may already end with a background
+ * reset; a foreground reset does not clear the background, and the suffix
+ * restores the default foreground without touching it. The row can also carry
+ * its own foreground sequences (the prompt is styled separately), so both full
+ * resets and foreground resets re-assert the tint — otherwise the prompt's
+ * trailing `\x1b[39m` would leave the command itself in the default color.
+ */
+export function highlightBashText(line: string, theme: Theme): string {
+	const fg = theme.getFgAnsi("bashMode");
+	const body = line.replace(/\x1b\[(?:0|39)m/g, (reset) => `${reset}${fg}`);
+	return `${fg}${body}\x1b[39m`;
+}
+
 // ============================================================================
 // Editor
 // ============================================================================
@@ -1159,9 +1182,10 @@ export class CodexComposer extends CustomEditor {
 		// row width is unchanged. Codex renders the prompt as bold default-fg.
 		// When the input starts with `!` (bash mode), pi highlights the editor
 		// border with the `bashMode` theme color (green). Since we replaced the
-		// border with a filled panel, we highlight the `❯` prompt instead.
-		// `isBashModeText` also accepts the `！` alias, so the prompt lights up
-		// even on the very first frame before the in-place rewrite lands.
+		// border with a filled panel, the `❯` prompt and the command text below
+		// carry that color instead. `isBashModeText` also accepts the `！` alias,
+		// so both light up even on the very first frame before the in-place
+		// rewrite lands.
 		const isBashMode = isBashModeText(this.getText());
 		const prompt = isBashMode
 			? this.piTheme.fg("bashMode", this.piTheme.bold(PROMPT_CHAR))
@@ -1176,10 +1200,22 @@ export class CodexComposer extends CustomEditor {
 			lines[i] = this.fillRow(lines[i], width, bg);
 		}
 
-		// Highlight `$skill` mentions last, after the panel fill: the fill already
-		// re-asserts the background after every `\x1b[0m`, so the highlight only
+		// Highlight the text rows last, after the panel fill so nothing in a row
+		// can drop the inline color. For `$skill` mentions, the fill has already
+		// re-asserted the background after every `\x1b[0m`, so the highlight only
 		// needs to re-assert its own foreground/bold after resets.
-		this.highlightSkills(lines, bottomBorder);
+		// Bash mode is a whole-composer mode, so its rows get the `bashMode` tint
+		// (same color as the `❯` prompt and pi's bash border). `$skill` mentions are
+		// model-prompt syntax, so they are not highlighted inside a shell command:
+		// `!echo $coss` stays one uniform command color instead of lighting up a
+		// shell variable that happens to share a skill's name.
+		if (isBashMode) {
+			for (let i = 1; i < bottomBorder; i++) {
+				lines[i] = highlightBashText(lines[i], this.piTheme);
+			}
+		} else {
+			this.highlightSkills(lines, bottomBorder);
+		}
 
 		// Prepend a single open row so the panel does not sit flush against the
 		// widget above (e.g. the status header). Because the text is centered in
