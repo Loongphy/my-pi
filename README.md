@@ -1,5 +1,26 @@
 # my-pi
 
+## 依赖与类型检查（按 pi 官方约定）
+
+本仓库是一个**本地 pi 包**（settings 里以目录路径注册）。pi 通过 jiti alias 把
+`@earendil-works/{pi-ai,pi-coding-agent,pi-tui}` 与 `typebox` 注入到扩展运行时，
+所以**加载这些扩展不需要 node_modules**；`node_modules` 只服务 `npm run check`（tsc）与编辑期。
+
+```json
+"peerDependencies": { "@earendil-works/pi-ai": "*", "@earendil-works/pi-coding-agent": "*", "@earendil-works/pi-tui": "*" },
+"devDependencies":  { "@earendil-works/{…}": "^1.4.0", "@types/node": "^24", "typescript": "^5.9" }
+```
+
+- 宿主包**绝不放 `dependencies`**（`docs/packages.md`：实体副本会绕过扩展模块映射，
+  `resource-loader.ts` 会报 extension warning）。
+- pi 升级后：`npm install && npm run check`（caret 范围会跟上新版本）。
+- 不要用软链指向 `/root/.vite-plus/packages/.../<hash>/…`：那个 `<hash>` 每次重装都变，
+  断链后 tsc 会报 `Cannot find type definition file for 'node'`。
+- `.npmrc` 里 `ignore-scripts=true`，与 pi 官方安装方式一致。
+
+注意：`trae` provider 已迁出到同级包 `/root/.pi/agent/pi-provider-trae`（见其 README）。
+
+
 A collection of [pi](https://pi.dev) extensions for an enhanced coding experience.
 
 ![Screenshot](https://github.com/user-attachments/assets/e8766ffd-3ff5-474b-a876-3b8f78bfd069)
