@@ -23,9 +23,31 @@ function markToolTui<T extends ToolRenderers>(renderers: T): T {
 
 /**
  * pi's ToolExecutionComponent always emits one blank line above a self-rendered tool row.
- * Remove it for tool-tui rows only; other self-rendering tools keep their spacing.
+ * Drop it only between consecutive tool-tui rows; keep it when the row follows
+ * assistant text/thinking or a different tool, so sections stay visually separated.
  * The patch is idempotent across /reload because it is stored on the prototype.
  */
+function findParent(root: any, target: any): any {
+	const children = root?.children;
+	if (!Array.isArray(children)) return undefined;
+	if (children.includes(target)) return root;
+	for (const child of children) {
+		const parent = findParent(child, target);
+		if (parent) return parent;
+	}
+	return undefined;
+}
+
+function parentOf(component: any): any {
+	const cached = component.__toolTuiParent;
+	if (cached && Array.isArray(cached.children) && cached.children.includes(component)) {
+		return cached;
+	}
+	const parent = findParent(component.ui, component);
+	if (parent) component.__toolTuiParent = parent;
+	return parent;
+}
+
 function installTightSpacingPatch(): void {
 	const proto = ToolExecutionComponent.prototype as any;
 	const patchKey = Symbol.for("tool-tui.tight-spacing");
@@ -34,7 +56,14 @@ function installTightSpacingPatch(): void {
 	if (typeof originalRender !== "function") return;
 	proto.render = function (width: number) {
 		const lines = originalRender.call(this, width);
-		if (this.toolDefinition?.[TOOL_TUI_MARKER] && lines.length > 0 && lines[0] === "") {
+		if (!this.toolDefinition?.[TOOL_TUI_MARKER]) return lines;
+		if (lines.length === 0 || lines[0] !== "") return lines;
+
+		const parent = parentOf(this);
+		const siblings = parent?.children;
+		const index = Array.isArray(siblings) ? siblings.indexOf(this) : -1;
+		const previous = index > 0 ? siblings[index - 1] : undefined;
+		if (previous?.toolDefinition?.[TOOL_TUI_MARKER]) {
 			return lines.slice(1);
 		}
 		return lines;
