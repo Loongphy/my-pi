@@ -5,7 +5,8 @@
  * Collapsed rows show only the call summary; ctrl+o expands the normal pi output.
  */
 
-import { isAbsolute, relative } from "node:path";
+import { homedir } from "node:os";
+import { isAbsolute, relative, sep } from "node:path";
 import {
 	ToolExecutionComponent,
 	type ExtensionAPI,
@@ -48,6 +49,16 @@ function parentOf(component: any): any {
 	return parent;
 }
 
+function isVisuallyEmpty(component: any, width: number): boolean {
+	try {
+		return component
+			.render(width)
+			.every((line: string) => line.replace(/\x1b\[[0-9;]*m/g, "").trim() === "");
+	} catch {
+		return false;
+	}
+}
+
 const ORIGINAL_RENDER = Symbol.for("tool-tui.original-render");
 const PATCHED_RENDER = Symbol.for("tool-tui.patched-render");
 
@@ -71,8 +82,18 @@ function installTightSpacingPatch(): void {
 		const parent = parentOf(this);
 		const siblings = parent?.children;
 		const index = Array.isArray(siblings) ? siblings.indexOf(this) : -1;
-		const previous = index > 0 ? siblings[index - 1] : undefined;
-		const tight = previous?.toolDefinition?.[TOOL_TUI_MARKER] === true;
+
+		// An assistant message that only carried tool calls renders no lines at all.
+		// Skip such empty siblings so sequential tool rows still count as consecutive.
+		let tight = false;
+		for (let i = index - 1; i >= 0; i--) {
+			const candidate = siblings[i];
+			if (candidate?.toolDefinition?.[TOOL_TUI_MARKER]) {
+				tight = true;
+				break;
+			}
+			if (!isVisuallyEmpty(candidate, width)) break;
+		}
 		const hasLeadingBlank = lines[0] === "";
 
 		// Normalize instead of only dropping: a previous tool-tui wrapper may already
@@ -174,11 +195,20 @@ function asNumber(value: unknown): number | undefined {
 	return undefined;
 }
 
+function shortenHome(value: string): string {
+	const home = homedir();
+	if (value === home) return "~";
+	if (value.startsWith(home + sep)) return `~${value.slice(home.length)}`;
+	return value;
+}
+
 function displayPath(value: unknown, cwd: string): string {
 	if (typeof value !== "string" || value.length === 0) return "...";
-	const rel = isAbsolute(value) ? relative(cwd, value) : value;
+	if (!isAbsolute(value)) return value.startsWith(".") ? value : `./${value}`;
+	const rel = relative(cwd, value);
 	if (!rel) return ".";
-	return rel.startsWith(".") ? rel : `./${rel}`;
+	if (!rel.startsWith("..")) return rel.startsWith(".") ? rel : `./${rel}`;
+	return shortenHome(value);
 }
 
 function stopSpinner(state: ToolTuiState): void {
@@ -210,10 +240,6 @@ function statusIcon(ctx: RenderContextLike, theme: Theme): string {
 function labelText(text: string, theme: Theme, ctx: RenderContextLike): string {
 	const color = ctx.isError ? "error" : ctx.isPartial ? "warning" : "success";
 	return theme.fg(color, theme.bold(text));
-}
-
-function verb(done: string, running: string, theme: Theme, ctx: RenderContextLike): string {
-	return labelText(ctx.isPartial ? running : done, theme, ctx);
 }
 
 function countLines(value: unknown): number {
@@ -344,11 +370,9 @@ function createReadRenderer(base: ToolRenderers | undefined): ToolRenderers {
 			const end =
 				state.end ?? (requestedLimit !== undefined ? start + requestedLimit - 1 : undefined);
 
-			let text = `${statusIcon(ctx, theme)} `;
+			let text = `${statusIcon(ctx, theme)} ${labelText("read", theme, ctx)} `;
 			if (hasRange) {
-				text += `${verb("Read lines", "Reading lines", theme, ctx)} ${theme.fg("warning", end !== undefined ? `${start}-${end}` : `${start}-…`)} ${theme.fg("toolOutput", "in")} `;
-			} else {
-				text += `${verb("Read", "Reading", theme, ctx)} `;
+				text += `${theme.fg("warning", end !== undefined ? `${start}-${end}` : `${start}-…`)} ${theme.fg("toolOutput", "in")} `;
 			}
 			text += theme.fg("accent", displayPath(args?.path ?? args?.file_path, ctx.cwd));
 
@@ -380,7 +404,7 @@ function createWriteRenderer(base: ToolRenderers | undefined): ToolRenderers {
 			const content = args?.content;
 			const lines = typeof content === "string" ? countLines(content) : undefined;
 
-			let text = `${statusIcon(ctx, theme)} ${verb("Wrote", "Writing", theme, ctx)} ${theme.fg("accent", displayPath(args?.path ?? args?.file_path, ctx.cwd))}`;
+			let text = `${statusIcon(ctx, theme)} ${labelText("write", theme, ctx)} ${theme.fg("accent", displayPath(args?.path ?? args?.file_path, ctx.cwd))}`;
 			let keepEnd = "";
 			if (ctx.isError && state.error) {
 				keepEnd = theme.fg("error", ` ${state.error}`);
@@ -408,7 +432,7 @@ function createEditRenderer(base: ToolRenderers | undefined): ToolRenderers {
 				state.removed = stats.removed;
 			}
 
-			let text = `${statusIcon(ctx, theme)} ${verb("Edited", "Editing", theme, ctx)} ${theme.fg("accent", displayPath(args?.path ?? args?.file_path, ctx.cwd))}`;
+			let text = `${statusIcon(ctx, theme)} ${labelText("edit", theme, ctx)} ${theme.fg("accent", displayPath(args?.path ?? args?.file_path, ctx.cwd))}`;
 			let keepEnd = "";
 			if (ctx.isError && state.error) {
 				keepEnd = theme.fg("error", ` ${state.error}`);
@@ -425,7 +449,6 @@ function createEditRenderer(base: ToolRenderers | undefined): ToolRenderers {
 }
 
 function createShellRenderer(base: ToolRenderers | undefined, shellName: string): ToolRenderers {
-	const label = shellName === "powershell" ? "ps" : "bash";
 	return {
 		...base,
 		renderShell: "self",
@@ -435,7 +458,7 @@ function createShellRenderer(base: ToolRenderers | undefined, shellName: string)
 				typeof args?.command === "string" ? args.command.replace(/\n/g, " ") : "...";
 			const timeout = asNumber(args?.timeout);
 
-			let text = `${statusIcon(ctx, theme)} ${labelText(label, theme, ctx)} ${theme.fg("warning", command)}`;
+			let text = `${statusIcon(ctx, theme)} ${labelText(shellName, theme, ctx)} ${theme.fg("warning", command)}`;
 			let keepEnd = "";
 			if (timeout !== undefined) {
 				keepEnd += theme.fg("muted", ` (timeout ${timeout}s)`);
