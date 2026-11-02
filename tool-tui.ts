@@ -157,6 +157,7 @@ interface ToolTuiState {
 	// errors
 	error?: string;
 	exitCode?: number | null;
+	timeout?: number;
 }
 
 interface ToolResultLike {
@@ -333,10 +334,17 @@ function updateShellState(result: ToolResultLike, ctx: RenderContextLike): void 
 	if (!ctx.isError) return;
 
 	const text = resultText(result);
-	const match = text.match(/Command exited with code (\d+)\s*$/);
-	const exitCode = match ? Number(match[1]) : null;
-	const error = match ? undefined : firstLine(text);
-	if (ctx.state.exitCode !== exitCode || ctx.state.error !== error) {
+	const timeoutMatch = text.match(/Command timed out after (\d+) seconds/);
+	const timeout = timeoutMatch ? Number(timeoutMatch[1]) : undefined;
+	const exitMatch = text.match(/Command exited with code (\d+)\s*$/);
+	const exitCode = exitMatch ? Number(exitMatch[1]) : null;
+	const error = timeoutMatch || exitMatch ? undefined : firstLine(text);
+	if (
+		ctx.state.timeout !== timeout ||
+		ctx.state.exitCode !== exitCode ||
+		ctx.state.error !== error
+	) {
+		ctx.state.timeout = timeout;
 		ctx.state.exitCode = exitCode;
 		ctx.state.error = error;
 		ctx.invalidate();
@@ -456,7 +464,8 @@ function createShellRenderer(base: ToolRenderers | undefined, shellName: string)
 			const state = ctx.state as ToolTuiState;
 			const command =
 				typeof args?.command === "string" ? args.command.replace(/\n/g, " ") : "...";
-			const timeout = asNumber(args?.timeout);
+			// Prefer the timeout reported by the result (the actual limit that fired).
+			const timeout = state.timeout ?? asNumber(args?.timeout);
 
 			let text = `${statusIcon(ctx, theme)} ${labelText(shellName, theme, ctx)} ${theme.fg("warning", command)}`;
 			let keepEnd = "";
