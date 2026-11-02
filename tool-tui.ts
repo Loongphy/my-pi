@@ -25,7 +25,7 @@ function markToolTui<T extends ToolRenderers>(renderers: T): T {
  * pi's ToolExecutionComponent always emits one blank line above a self-rendered tool row.
  * Drop it only between consecutive tool-tui rows; keep it when the row follows
  * assistant text/thinking or a different tool, so sections stay visually separated.
- * The patch is idempotent across /reload because it is stored on the prototype.
+ * The wrapper is replaced on /reload so a fixed version takes effect without a restart.
  */
 function findParent(root: any, target: any): any {
 	const children = root?.children;
@@ -48,27 +48,43 @@ function parentOf(component: any): any {
 	return parent;
 }
 
+const ORIGINAL_RENDER = Symbol.for("tool-tui.original-render");
+const PATCHED_RENDER = Symbol.for("tool-tui.patched-render");
+
 function installTightSpacingPatch(): void {
 	const proto = ToolExecutionComponent.prototype as any;
-	const patchKey = Symbol.for("tool-tui.tight-spacing");
-	if (proto[patchKey]) return;
-	const originalRender = proto.render;
-	if (typeof originalRender !== "function") return;
-	proto.render = function (width: number) {
+	const current = proto.render;
+	if (typeof current !== "function") return;
+
+	// On the first load this is pi's render. On /reload it is our previous wrapper,
+	// so keep the true original instead of stacking wrappers. If another extension
+	// patched after us, chain through theirs instead of dropping it.
+	if (current !== proto[PATCHED_RENDER]) {
+		proto[ORIGINAL_RENDER] = current;
+	}
+	const originalRender = proto[ORIGINAL_RENDER];
+
+	const wrapper = function (this: any, width: number) {
 		const lines = originalRender.call(this, width);
-		if (!this.toolDefinition?.[TOOL_TUI_MARKER]) return lines;
-		if (lines.length === 0 || lines[0] !== "") return lines;
+		if (!this.toolDefinition?.[TOOL_TUI_MARKER] || lines.length === 0) return lines;
 
 		const parent = parentOf(this);
 		const siblings = parent?.children;
 		const index = Array.isArray(siblings) ? siblings.indexOf(this) : -1;
 		const previous = index > 0 ? siblings[index - 1] : undefined;
-		if (previous?.toolDefinition?.[TOOL_TUI_MARKER]) {
-			return lines.slice(1);
-		}
+		const tight = previous?.toolDefinition?.[TOOL_TUI_MARKER] === true;
+		const hasLeadingBlank = lines[0] === "";
+
+		// Normalize instead of only dropping: a previous tool-tui wrapper may already
+		// have removed the blank unconditionally, so add it back when this row starts
+		// a new section (after thinking text or a different tool).
+		if (tight && hasLeadingBlank) return lines.slice(1);
+		if (!tight && !hasLeadingBlank) return ["", ...lines];
 		return lines;
 	};
-	proto[patchKey] = true;
+
+	proto[PATCHED_RENDER] = wrapper;
+	proto.render = wrapper;
 }
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
