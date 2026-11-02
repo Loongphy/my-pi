@@ -370,21 +370,21 @@ function createReadRenderer(base: ToolRenderers | undefined): ToolRenderers {
 			const end =
 				state.end ?? (requestedLimit !== undefined ? start + requestedLimit - 1 : undefined);
 
-			let text = `${statusIcon(ctx, theme)} ${labelText("read", theme, ctx)} `;
+			let text = `${statusIcon(ctx, theme)} ${labelText("read", theme, ctx)} ${theme.fg("accent", displayPath(args?.path ?? args?.file_path, ctx.cwd))}`;
 			if (hasRange) {
-				text += `${theme.fg("warning", end !== undefined ? `${start}-${end}` : `${start}-…`)} ${theme.fg("toolOutput", "in")} `;
+				const range = end !== undefined ? `${start}-${end}` : `${start}-…`;
+				text += ` ${theme.fg("toolOutput", "lines")} ${theme.fg("warning", range)}`;
 			}
-			text += theme.fg("accent", displayPath(args?.path ?? args?.file_path, ctx.cwd));
 
 			let keepEnd = "";
 			if (ctx.isError && state.error) {
 				keepEnd = theme.fg("error", ` ${state.error}`);
-			} else if (state.image) {
-				keepEnd = theme.fg("muted", " image");
-			} else if (state.lines !== undefined) {
-				keepEnd = theme.fg("muted", ` ${state.lines} lines`);
-			} else if (requestedLimit !== undefined) {
-				keepEnd = theme.fg("muted", ` ${requestedLimit} lines`);
+			} else if (!hasRange) {
+				if (state.image) {
+					keepEnd = theme.fg("muted", " image");
+				} else if (state.lines !== undefined) {
+					keepEnd = theme.fg("muted", ` ${state.lines} lines`);
+				}
 			}
 			return new OneLine(text, keepEnd);
 		},
