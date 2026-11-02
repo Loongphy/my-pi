@@ -13,17 +13,20 @@
 		"shortcuts.ts",
 		"429-retry.ts",
 		"bash-default-timeout.ts",
+		"tool-tui.ts",
 		"status/",
 		"thinking-level.ts",
 		"session-workbench.ts"
 	],
 	"pi": {
 		"extensions": [
+			"./auto-update.ts",
 			"./editor.ts",
 			"./request-logger.ts",
 			"./shortcuts.ts",
 			"./429-retry.ts",
 			"./bash-default-timeout.ts",
+			"./tool-tui.ts",
 			"./status/",
 			"./thinking-level.ts",
 			"./session-workbench.ts"
