@@ -78,6 +78,7 @@ A comprehensive status bar suite with multiple modules:
 - **Composer** — codex-style input area with a bold `❯` prompt (highlighted in `!bash` mode, `！` alias included)
 - **Skill mentions** — `$skill` mentions render bold in the theme accent; typing `$` opens the mention picker with all indexed skills (agents, codex, claude, pi); unknown `$tokens` are left untouched. Chinese IMEs work too: Shift+4 gives `￥`, which opens the same picker and is rewritten to `$` **in the composer** the moment the token names a skill (`￥coss` → `$coss` under the caret), so highlighting and the submitted prompt keep the plain `$` rules — and a non-resolving `￥100` stays a price
 - **Bash alias** — Chinese IMEs: Shift+1 gives `！` (U+FF01), rewritten to `!` **in the composer** when leading (`！ls` → `!ls`, `！！`/`！!`/`!！` → `!!`); a `！` elsewhere stays punctuation (`你好！` never runs)
+- **Fullscreen quote** — in fullscreen mode, a mouse drag over the transcript only copies (pi's copy-on-select); press `Enter` while that selection is active to quote it into the composer as a Markdown blockquote (`> line`) followed by a blank line, with the caret ready for your question. Any other key dismisses the transcript selection, so a copy-only selection never hijacks a later Enter submitted with a draft. Only transcript selections are quoted (drags over the composer are ignored), and the gesture follows grok-build's block-viewer quote (`Enter` on a selected block) so the quoted material is visually distinct from the prompt
 
 **File:** `editor.ts`
 
@@ -94,6 +95,10 @@ Logs every provider request to `~/.pi/agent/requests/<session>.request.log` — 
 ### shortcuts
 
 `Alt+C` copies the current editor content to the system clipboard. (Formerly `Ctrl+Shift+C`, which Windows Terminal intercepts for its own Copy action whenever any text is selected in the terminal — the key never reached pi in that state.)
+
+`Alt+K` / `Alt+J` jump to the previous / next **final assistant answer** in fullscreen mode. Each stop is the last qualifying assistant body of one user turn: user prompts, intermediate assistant messages that end in tool calls, and earlier retry/aborted partial replies are skipped. So with several queued prompts one press moves one prompt back or forward. At the first answer, `Alt+K` moves to its first line; past the last answer, `Alt+J` returns to the live end of the transcript.
+
+Pi's built-in `Ctrl+Shift+Up` / `Ctrl+Shift+Down` (`Ctrl+Up` / `Ctrl+Down` on Windows/WSL) already jumps between OSC 133 marked messages, but that includes the user message at the start of every turn — hence two stops per queued prompt. The `Alt+J/K` shortcuts use the same fullscreen renderer but only stop at final assistant replies.
 
 **File:** `shortcuts.ts`
 

@@ -87,6 +87,30 @@
  * rebuilds it. Rendering is ANSI-aware: tokens keep their highlight even when
  * the editor's inverted cursor sits on a character inside the token.
  *
+ * ── 3. Fullscreen selection quoting ────────────────────────────────────────
+ * In fullscreen mode pi owns mouse selection (the transcript is not the
+ * terminal emulator's scrollback), and a plain drag release only copies — which
+ * is all a user who just wants the clipboard needs. Pressing `Enter` while a
+ * transcript selection is active turns it into a prompt quote: the selected
+ * text is inserted into the composer as a Markdown blockquote (`> line`),
+ * followed by a blank line, with the caret left there for the user's question.
+ * The gesture mirrors grok-build's block-viewer quote (`Enter` on a selected
+ * block): a blockquote clearly delimits quoted material without hiding it from
+ * the model, and the trailing blank line separates the quote from the prompt.
+ *
+ * Any other key dismisses the selection, so a selection left over from a copy
+ * action never hijacks a later Enter meant to submit the draft. Only
+ * transcript selections are quoted (dragging over the composer itself is
+ * ignored), and only when the composer already has focus, so a capturing
+ * dialog or a detached editor is never hijacked. A non-capturing overlay (a
+ * toast, extra status, etc.) does not block quoting: pi disables scroll-view
+ * mapping for selections while any overlay is open, and those screen-row
+ * selections are accepted when both endpoints sit above the composer. The
+ * selection is read through `TuiAltScreen.getActiveSelectionText()`; pi 1.4
+ * exposes only the boolean `hasActiveSelection()` / the clipboard action, so
+ * the getter is called defensively and the feature simply disables itself if a
+ * future pi renames it.
+ *
  * Usage: pi --extension ./examples/extensions/codex-composer.ts
  */
 
@@ -109,6 +133,7 @@ import {
 	SelectList,
 	type SelectListLayoutOptions,
 	type TUI,
+	matchesKey,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 
@@ -901,6 +926,140 @@ export function highlightBashText(line: string, theme: Theme): string {
 }
 
 // ============================================================================
+// Fullscreen selection quoting
+// ============================================================================
+
+/**
+ * Format a transcript selection as a Markdown blockquote, following
+ * grok-build's `format_blockquote` (`> line`, with a bare `>` for a blank
+ * line). Trailing newlines are dropped so a selection ending at a line break
+ * does not produce an extra empty quote line.
+ */
+export function formatSelectionQuote(text: string): string {
+	const normalized = text.replace(/\r\n?/g, "\n").replace(/\n+$/, "");
+	if (normalized.length === 0) return "";
+	return normalized
+		.split("\n")
+		.map((line) => (line.length === 0 ? ">" : `> ${line}`))
+		.join("\n");
+}
+
+/** One endpoint of `TuiAltScreen`'s private selection state. */
+interface FullscreenSelectionPoint {
+	row: number;
+	col: number;
+	boundary?: boolean;
+	scrollView?: unknown;
+}
+
+/** Minimal shape of `TuiAltScreen`'s private layout boxes. */
+interface LayoutBoxLike {
+	component?: unknown;
+	rect: { x: number; y: number; width: number; height: number };
+	children?: LayoutBoxLike[];
+}
+
+/**
+ * The part of `TuiAltScreen` this feature reads. `getActiveSelectionText`,
+ * `resetTextSelection`, `selectionPressActive`, `selectionAnchor`,
+ * `selectionFocus`, and `currentLayout` are private in pi 1.4 — the public
+ * surface only has `hasActiveSelection()` and the clipboard action — so all of
+ * them are optional and the feature degrades to a no-op if they disappear.
+ */
+interface FullscreenSelectionTui extends TUI {
+	getActiveSelectionText?(): string | undefined;
+	resetTextSelection?(): void;
+	flash?(message: string, durationMs?: number): void;
+	selectionPressActive?: boolean;
+	selectionAnchor?: FullscreenSelectionPoint;
+	selectionFocus?: FullscreenSelectionPoint;
+	/** Private layout frame; used to locate the composer on screen. */
+	currentLayout?: { root?: LayoutBoxLike };
+}
+
+/** Whether `root` is `target` or contains it in its component child tree. */
+function componentContains(root: unknown, target: unknown): boolean {
+	if (root === target) return true;
+	const children = (root as { children?: unknown[] } | undefined)?.children;
+	if (!Array.isArray(children)) return false;
+	return children.some((child) => componentContains(child, target));
+}
+
+/**
+ * Top row (0-based) of the editor slot containing `component` in the current
+ * fullscreen layout. The composer itself is not a layout leaf (it lives inside
+ * the editor `Container`), so find the deepest layout box whose component
+ * subtree contains it. Taking the greatest `y` skips the dock/root ancestors
+ * and lands on the editor slot.
+ */
+function findComponentTop(tui: TUI, component: unknown): number | undefined {
+	const root = (tui as FullscreenSelectionTui).currentLayout?.root;
+	if (!root) return undefined;
+	let top: number | undefined;
+	const stack: LayoutBoxLike[] = [root];
+	while (stack.length > 0) {
+		const box = stack.pop()!;
+		if (box.component !== undefined && componentContains(box.component, component)) {
+			if (top === undefined || box.rect.y > top) top = box.rect.y;
+		}
+		if (box.children) stack.push(...box.children);
+	}
+	return top;
+}
+
+interface TranscriptSelectionRefs {
+	anchor: FullscreenSelectionPoint;
+	focus: FullscreenSelectionPoint;
+}
+
+/** Whether the endpoints describe a non-empty range (not a plain click). */
+function hasSelectionRange(refs: TranscriptSelectionRefs): boolean {
+	return refs.anchor.row !== refs.focus.row || refs.anchor.col !== refs.focus.col;
+}
+
+/**
+ * The endpoints of a released fullscreen transcript selection, if there is
+ * one. In-progress drags, composer selections, and selections spanning
+ * different scroll views have no quotable transcript range and return
+ * undefined.
+ *
+ * When any overlay is open, `TuiAltScreen` deliberately disables scroll-view
+ * mapping for selections (`scrollView` is undefined) and reconstructs text
+ * from screen rows instead. Accept those selections only when both endpoints
+ * sit above the composer, which keeps transcript quoting working with a
+ * non-capturing overlay (toast, extra status, etc.) while still rejecting
+ * selections made inside the composer itself.
+ */
+function readTranscriptSelectionRefs(tui: TUI, composer?: unknown): TranscriptSelectionRefs | undefined {
+	if (tui.mode !== "fullscreen") return undefined;
+	const fullscreen = tui as FullscreenSelectionTui;
+	if (fullscreen.selectionPressActive !== false) return undefined;
+	const anchor = fullscreen.selectionAnchor;
+	const focus = fullscreen.selectionFocus;
+	if (!anchor || !focus) return undefined;
+
+	if (anchor.scrollView) {
+		return anchor.scrollView === focus.scrollView ? { anchor, focus } : undefined;
+	}
+
+	const composerTop = composer === undefined ? undefined : findComponentTop(tui, composer);
+	if (composerTop === undefined) return undefined;
+	if (anchor.row >= composerTop || focus.row >= composerTop) return undefined;
+	return { anchor, focus };
+}
+
+/** Read the text of a released fullscreen transcript selection, if any. */
+function readTranscriptSelection(tui: TUI, composer?: unknown): string | undefined {
+	if (!readTranscriptSelectionRefs(tui, composer)) return undefined;
+	const fullscreen = tui as FullscreenSelectionTui;
+	const read = fullscreen.getActiveSelectionText;
+	if (typeof read !== "function") return undefined;
+
+	const text = read.call(tui);
+	return typeof text === "string" && text.trim().length > 0 ? text : undefined;
+}
+
+// ============================================================================
 // Editor
 // ============================================================================
 
@@ -1088,6 +1247,90 @@ export class CodexComposer extends CustomEditor {
 			return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Enter with a fullscreen transcript selection quotes it into the composer
+	 * as a Markdown blockquote, instead of submitting the draft. A plain mouse
+	 * drag still only copies (pi's copy-on-select), so selecting text for the
+	 * clipboard is never turned into a prompt quote by accident.
+	 */
+	override handleInput(data: string): void {
+		const tui = this.tui;
+		// `\n` is Shift+Enter / Ctrl+J (newline) in the editor's own parser even
+		// when the legacy key matcher also calls it Enter; never turn that into a
+		// quote.
+		if (
+			tui.mode === "fullscreen" &&
+			data !== "\n" &&
+			matchesKey(data, "enter") &&
+			!this.isShowingAutocomplete()
+		) {
+			const refs = readTranscriptSelectionRefs(tui, this);
+			if (refs && hasSelectionRange(refs)) {
+				if (this.quoteFullscreenSelection()) return;
+
+				// There is a visible selection but no quotable text (blank line,
+				// whitespace-only, or a transient layout read failure). Never fall
+				// through to submit the draft: swallow the Enter and drop the
+				// selection so the next Enter behaves normally.
+				const fullscreen = tui as FullscreenSelectionTui;
+				fullscreen.resetTextSelection?.();
+				fullscreen.flash?.("Could not quote selection");
+				tui.requestRender();
+				return;
+			}
+		}
+
+		super.handleInput(data);
+
+		// Any other key dismisses the transcript selection. This is what keeps a
+		// selection made for copying from hijacking a later Enter: typing a
+		// question removes the selection, so Enter submits the draft. Clearing
+		// after `super` leaves app actions such as Ctrl+X able to read the
+		// selection synchronously first.
+		if (tui.mode === "fullscreen" && readTranscriptSelectionRefs(tui, this)) {
+			(tui as FullscreenSelectionTui).resetTextSelection?.();
+		}
+	}
+
+	/**
+	 * Quote the current fullscreen transcript selection into the composer and
+	 * leave the caret on the blank line after it, ready for the user's question.
+	 * Returns true when a quote was inserted (so the Enter is swallowed).
+	 *
+	 * The composer must already be focused: selection over the transcript does
+	 * not move focus, so this is true in the normal prompt workflow, while an
+	 * open dialog (which should keep the quote out of the editor) fails it.
+	 */
+	private quoteFullscreenSelection(): boolean {
+		// Focus is the right gate: a capturing overlay/dialog has already taken
+		// keyboard focus, while a non-capturing overlay (a toast, extra status,
+		// etc.) does not block the composer and must not disable quoting.
+		if (!this.focused) return false;
+		const tui = this.tui;
+		if (tui.mode !== "fullscreen") return false;
+
+		const text = readTranscriptSelection(tui, this);
+		if (!text) return false;
+		const quote = formatSelectionQuote(text);
+		if (!quote) return false;
+
+		// Keep the quote on its own line when the caret sits mid-line, and add a
+		// blank line after it (grok-build does the same) so the user can type the
+		// actual question without deleting anything.
+		const prefix = this.getCursor().col > 0 ? "\n" : "";
+		this.insertTextAtCursor(`${prefix}${quote}\n\n`);
+
+		// The quote is now in the composer; drop the transcript highlight so the
+		// gesture reads as consumed and the next Enter submits normally.
+		(tui as FullscreenSelectionTui).resetTextSelection?.();
+
+		// Selection does not normally steal focus, but make the "focus back in
+		// the editor" guarantee explicit and refresh the panel.
+		tui.setFocus(this);
+		tui.requestRender();
+		return true;
 	}
 
 	/**
