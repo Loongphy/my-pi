@@ -8,6 +8,7 @@
 		"url": "https://github.com/Loongphy/my-pi.git"
 	},
 	"files": [
+		"auto-update.ts",
 		"editor.ts",
 		"request-logger.ts",
 		"shortcuts.ts",
