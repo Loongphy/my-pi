@@ -122,6 +122,16 @@ const RATE_LIMIT_RULES: RateLimitRule[] = [
     isTerminal: (body) =>
       /FreeUsageLimitError|GoUsageLimitError|UsageLimitError|insufficient_quota|Monthly usage limit/i.test(body),
   },
+  // devin (server.codeium.com): the provider owns both the rolling
+  // 5-requests/60 s `request rate limit` and the free-model 429. Hand every
+  // Devin 429 back so the provider's client-side limiter can wait for a slot
+  // and retry transparently; the generic fetch-layer backoff would consume
+  // the five grace slots and make the reset longer.
+  {
+    name: "devin",
+    match: (url) => url.includes("server.codeium.com"),
+    isTerminal: () => true,
+  },
   // trae-work: no trustworthy permanent-429 signature yet (code 1001 is an
   // auth expiry handled by the trae plugin itself), so no rule -> default
   // retry. Add a rule here once a signature is found.
