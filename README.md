@@ -84,7 +84,22 @@ Devin-CLI style compact rendering for the built-in `read`, `write`, `edit`, `bas
 
 ### bash-default-timeout
 
-Gives the `bash` / `powershell` tools a default 60s timeout when the model does not pass one (an explicit `timeout` is kept as-is). The wrapped `renderCall` also shows `(timeout 60s)` in the TUI, which pi cannot do on its own — the call is drawn during `tool_execution_start`, before the timeout is injected.
+pi ships no default shell timeout (`timeout` is `optional, no default timeout`), so a model that omits it can hang a tool call forever. This extension always injects one:
+
+- **Missing timeout** → 60s, or 600s for commands that legitimately run long (`npm install`, `cargo build`, `pytest`, `docker build`, `git clone`, …). `npm run dev`-style servers intentionally stay on the short default.
+- **Millisecond mixups** → a value above 3600 that is a multiple of 1000 is read as milliseconds, then clamped. Models routinely send `180000` meaning "3 minutes"; pi would take that as 50 hours (earendil-works/pi#9785).
+- **Ceiling** → nothing exceeds 7200s, whatever the model sends.
+- **Prompt alignment** → the `timeout` schema text and a guideline bullet are rewritten, because pi's own text tells the model there is no default.
+- **TUI** → the wrapped `renderCall` shows the deadline that will actually apply, e.g. `(timeout 600s)`, which pi cannot do on its own: the call is drawn during `tool_execution_start`, before the timeout is injected.
+
+The `tool_call` hook covers every path, including nested calls from `codemode` and subagents. Your own `!command` runs go through `user_bash` and are left alone. `powershell` is only registered on Windows, so Linux/macOS sessions do not gain an extra tool.
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `PI_BASH_TIMEOUT_SECONDS` | `60` | Deadline injected when the model omits `timeout`. |
+| `PI_BASH_LONG_TIMEOUT_SECONDS` | `600` | Deadline for installs, builds and test runs. |
+| `PI_BASH_MAX_TIMEOUT_SECONDS` | `7200` | Hard ceiling applied to every value. |
+| `PI_BASH_NO_MS_HEURISTIC` | unset | Set to any value to keep millisecond-looking numbers as seconds. |
 
 **File:** `bash-default-timeout.ts`
 
