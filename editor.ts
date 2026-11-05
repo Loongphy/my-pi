@@ -10,11 +10,20 @@
  * and a bold prompt sitting in the left gutter of the first text line. (Codex
  * uses `›`; this extension uses its heavy variant `❯`, which reads larger.)
  *
- * Codex fills the composer with the same background it uses for user messages
- * (`user_message_style()` in codex-rs/tui/src/style.rs). This extension does the
- * same via pi's `userMessageBg` theme token, so the panel is a subtle neutral
- * surface that adapts to dark themes (slightly lighter than the background) and
- * light themes (slightly darker) automatically, exactly like Codex.
+ * Both surfaces use Codex's *neutral* surface colors, ported from
+ * codex-rs/tui/src/style.rs (see CODEX_SURFACE_ALPHAS below): the composer is
+ * `user_message_bg_rgb()` and submitted prompts are `history_prompt_style()`.
+ * Each is a hue-free blend of the terminal's own background toward white (dark
+ * terminals) or black (light terminals), with a slightly lighter fill for
+ * submitted prompts. This replaces pi's built-in `userMessageBg`, which belongs
+ * to the blue family (dark.json `blueBg`, and the system theme derives it from
+ * ANSI slot 4) and used to paint both surfaces a blue slab.
+ *
+ * Only those two backgrounds change. The composer takes its color directly
+ * here; pi's UserMessageComponent keeps reading `theme.bg("userMessageBg")`,
+ * so we patch just that token's cached ANSI sequence on the live Theme. No
+ * other theme token is rebuilt or touched, and the patch re-applies on every
+ * frame so runtime theme switches keep working.
  *
  * ── 2. `$skill` mention highlighting + completion (codex-style) ───────────
  * While typing, any `$name` token that resolves to a skill is rendered bold in
@@ -127,8 +136,10 @@ import {
 import {
 	type AutocompleteItem,
 	type AutocompleteProvider,
+	backgroundAnsi,
 	Editor,
 	type EditorTheme,
+	rgbColor,
 	type SelectItem,
 	SelectList,
 	type SelectListLayoutOptions,
@@ -145,6 +156,90 @@ const PROMPT_CHAR = "❯";
 const PROMPT_GUTTER_COLS = 2;
 
 const RESET_BG = "\x1b[49m";
+
+// ── Codex surface colors ────────────────────────────────────────────────────
+// Ported from codex-rs/tui/src/style.rs. Codex gives neither the composer nor
+// submitted prompts a hue of its own: both are neutral fills mixed from the
+// terminal's *own* background, so they read as a subtle elevation of whatever
+// theme the terminal uses instead of a colored card.
+//
+//   surface        dark terminal            light terminal
+//   composer       blend(white, bg, .12)   blend(black, bg, .04)
+//   user message   blend(white, bg, .16)   blend(black, bg, .02)
+//
+// The submitted prompt is a shade lighter than the editable composer in either
+// appearance (Codex: "Submitted prompts use a lighter fill than the editable
+// composer in either theme"). Codex quantizes with `best_color()`; pi's
+// `backgroundAnsi()` does the same for truecolor / 256-color modes.
+const CODEX_SURFACE_ALPHAS = {
+	composer: { dark: 0.12, light: 0.04 },
+	userMessage: { dark: 0.16, light: 0.02 },
+} as const;
+
+type Rgb = { r: number; g: number; b: number };
+
+/** Codex `color.rs::is_light`: luma > 128. */
+function isLightBackground(bg: Rgb): boolean {
+	return 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b > 128;
+}
+
+/** Codex `color.rs::blend`: straight sRGB interpolation, truncated like `as u8`. */
+function blendToward(top: Rgb, bg: Rgb, alpha: number): Rgb {
+	return {
+		r: Math.trunc(top.r * alpha + bg.r * (1 - alpha)),
+		g: Math.trunc(top.g * alpha + bg.g * (1 - alpha)),
+		b: Math.trunc(top.b * alpha + bg.b * (1 - alpha)),
+	};
+}
+
+/**
+ * The terminal background pi already queried at startup (OSC 10/11). `theme`
+ * is pi's live Proxy; reading `colors` makes its getter cache
+ * `resolvedColors.terminal` on the underlying instance. The field is guarded
+ * because a future pi may keep those colors elsewhere — in that case we fall
+ * back to the same black/white guesses pi itself uses for an unreported
+ * background (`GUESSED_DEFAULT_COLORS` in theme.ts).
+ */
+function terminalBackground(theme: Theme): Rgb {
+	void theme.colors;
+	const cached = (
+		theme as unknown as { resolvedColors?: { terminal?: { background?: Rgb } } }
+	).resolvedColors?.terminal?.background;
+	if (cached && Number.isFinite(cached.r) && Number.isFinite(cached.g) && Number.isFinite(cached.b)) {
+		return cached;
+	}
+	return theme.appearance === "light" ? { r: 255, g: 255, b: 255 } : { r: 0, g: 0, b: 0 };
+}
+
+/** Background SGR sequence for one of Codex's two neutral surfaces. */
+export function codexSurfaceAnsi(theme: Theme, surface: keyof typeof CODEX_SURFACE_ALPHAS): string {
+	const bg = terminalBackground(theme);
+	const light = isLightBackground(bg);
+	const alpha = CODEX_SURFACE_ALPHAS[surface][light ? "light" : "dark"];
+	const top = light ? { r: 0, g: 0, b: 0 } : { r: 255, g: 255, b: 255 };
+	const color = blendToward(top, bg, alpha);
+	return backgroundAnsi(rgbColor(color.r, color.g, color.b), theme.getColorMode());
+}
+
+/**
+ * Override only `userMessageBg`'s cached background escape sequence on the
+ * live Theme, so pi's UserMessageComponent renders the second Codex surface.
+ * Idempotent and self-healing: comparing against the cached value re-applies
+ * the patch when pi swaps in a new Theme instance (theme switch, terminal color
+ * report) without ever touching another token. HTML export colors come from
+ * `theme.colors`, which is deliberately left alone.
+ */
+export function syncCodexUserMessageBg(theme: Theme): void {
+	try {
+		const bgAnsi = (theme as unknown as { bgAnsi?: Map<string, string> }).bgAnsi;
+		if (!bgAnsi) return;
+		const ansi = codexSurfaceAnsi(theme, "userMessage");
+		if (bgAnsi.get("userMessageBg") !== ansi) bgAnsi.set("userMessageBg", ansi);
+	} catch {
+		// Theme not initialised yet (or a future pi changed its internals).
+		// render() retries on the next frame; the composer still gets its fill.
+	}
+}
 
 /**
  * Mention sigils. `$` is the canonical form; `￥` (U+FFE5, the yuan sign Pinyin
@@ -1406,10 +1501,11 @@ export class CodexComposer extends CustomEditor {
 			return lines;
 		}
 
-		// Same background pi uses for user messages, matching Codex's composer.
-		// It is defined per theme, so dark and light themes each get a suitable
-		// panel without any color math here.
-		const bg = this.piTheme.getBgAnsi("userMessageBg");
+		// Codex's two neutral surfaces. The composer takes its own (darker)
+		// fill here instead of pi's blue `userMessageBg`; submitted user
+		// messages get the lighter one via the token patch below.
+		syncCodexUserMessageBg(this.piTheme);
+		const bg = codexSurfaceAnsi(this.piTheme, "composer");
 
 		// The composer is everything up to and including the bottom border. The
 		// bottom border is the last row that still contains a `─` glyph; any
@@ -1474,6 +1570,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		// ctx.ui.theme is a live reference: it tracks runtime theme switches.
 		const theme = ctx.ui.theme;
+		// Patch `userMessageBg` before the first frame so replayed history is
+		// already Codex-colored; render() keeps it in sync afterwards.
+		syncCodexUserMessageBg(theme);
 		// Index the four skill formats (agents standard / codex / claude / pi)
 		// for this session's working directory, including project-local roots.
 		// Refetchable: new skills added mid-session show up without `/reload`.
