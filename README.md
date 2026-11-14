@@ -42,103 +42,131 @@ Only this package:
 pi update https://github.com/Loongphy/my-pi
 ```
 
-## Extensions
+## status/index.ts
 
-### status
+A status bar suite: a header above the editor showing model, working directory and git branch, token stats, context usage, generation speed and TTFT; an animated terminal title during agent activity; and `/statusline` to choose which items appear.
 
-A comprehensive status bar suite with multiple modules:
-
-| Module | Description |
-|--------|-------------|
-| **index.ts** | Main extension entry point, orchestrates all status modules |
-| **header.ts** | Rich status header above the editor showing model, working directory + git branch, token statistics, context usage, generation speed, and TTFT |
-| **git.ts** | Git status detection — branch name, ahead/behind counts, staged/modified/deleted/conflicted/untracked file counts |
-| **tps.ts** | Token speed engine — real-time TPS estimation during streaming, accurate TPS after completion, TTFT measurement |
-| **title.ts** | Animated terminal title with a braille spinner during agent activity |
-| **statusline.ts** | `/statusline` command for interactive configuration of which items appear in the header |
-
-**Files:** `status/index.ts`, `status/header.ts`, `status/git.ts`, `status/tps.ts`, `status/title.ts`, `status/statusline.ts`
+| Module | What it does |
+|--------|--------------|
+| index | Entry point, orchestrates the footer slots and status modules |
+| header | Rich status header above the editor |
+| git | Branch, ahead/behind, staged/modified/deleted/untracked counts |
+| tps | Live TPS estimate while streaming, accurate TPS after completion, TTFT |
+| title | Braille spinner in the terminal title |
+| statusline | `/statusline` config command |
 
 ---
 
-### auto-update
-
-Checks extension packages on TUI startup and, when updates exist, runs the same command you would type in shell mode — `pi update --extensions` — in a **separate process**. The child's stdout/stderr are piped, so npm never writes to the terminal, the composer stays untouched, and the result is appended to the transcript as a custom entry (not sent to the LLM). With no updates or a failed check, it stays completely silent.
-
-Manual command: `/ext-update [package]` (equivalent to `pi update --extensions` / `pi update --extension <package>`).
-
-- `PI_AUTO_UPDATE_EXTENSIONS=update|check|off` — default `update`; `check` only notifies, `off` disables the startup check.
-- `PI_OFFLINE=1` skips the startup check.
-
-**File:** `auto-update.ts`
-
----
-
-### tool-tui
-
-Devin-CLI style compact rendering for the built-in `read`, `write`, `edit`, `bash` and `powershell` tools: every call collapses to a single row — status icon, tool name, path or command, plus the numbers that matter (`+12 -3` for writes/edits, `120 lines` or `lines 40-80` for reads, `(timeout 60s)` / `(exit 1)` for shells). `Ctrl+O` still expands the original pi output; tool behavior is untouched.
-
-**File:** `tool-tui.ts`
-
----
-
-### bash-default-timeout
-
-pi ships no default shell timeout (`timeout` is `optional, no default timeout`), so a model that omits it can hang a tool call forever. This extension always injects one:
-
-- **Missing timeout** → 60s, or 600s for commands that legitimately run long (`npm install`, `cargo build`, `pytest`, `docker build`, `git clone`, …). `npm run dev`-style servers intentionally stay on the short default.
-- **Millisecond mixups** → a value above 3600 that is a multiple of 1000 is read as milliseconds, then clamped. Models routinely send `180000` meaning "3 minutes"; pi would take that as 50 hours (earendil-works/pi#9785).
-- **Ceiling** → nothing exceeds 7200s, whatever the model sends.
-- **Prompt alignment** → the `timeout` schema text and a guideline bullet are rewritten, because pi's own text tells the model there is no default.
-- **TUI** → the wrapped `renderCall` shows the deadline that will actually apply, e.g. `(timeout 600s)`, which pi cannot do on its own: the call is drawn during `tool_execution_start`, before the timeout is injected.
-
-The `tool_call` hook covers every path, including nested calls from `codemode` and subagents. Your own `!command` runs go through `user_bash` and are left alone. `powershell` is only registered on Windows, so Linux/macOS sessions do not gain an extra tool.
-
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `PI_BASH_TIMEOUT_SECONDS` | `60` | Deadline injected when the model omits `timeout`. |
-| `PI_BASH_LONG_TIMEOUT_SECONDS` | `600` | Deadline for installs, builds and test runs. |
-| `PI_BASH_MAX_TIMEOUT_SECONDS` | `7200` | Hard ceiling applied to every value. |
-| `PI_BASH_NO_MS_HEURISTIC` | unset | Set to any value to keep millisecond-looking numbers as seconds. |
-
-**File:** `bash-default-timeout.ts`
-
----
-
-### editor
+## editor.ts
 
 ![editor](https://github.com/user-attachments/assets/37fdd8a3-f924-4829-a4eb-ad9b2f42c187)
 
-- **Composer** — codex-style input area with a bold `❯` prompt (highlighted in `!bash` mode, `！` alias included)
-- **Skill mentions** — `$skill` mentions render bold in the theme accent; typing `$` opens the mention picker with all indexed skills (agents, codex, claude, pi); unknown `$tokens` are left untouched. Chinese IMEs work too: Shift+4 gives `￥`, which opens the same picker and is rewritten to `$` **in the composer** the moment the token names a skill (`￥coss` → `$coss` under the caret), so highlighting and the submitted prompt keep the plain `$` rules — and a non-resolving `￥100` stays a price
-- **Bash alias** — Chinese IMEs: Shift+1 gives `！` (U+FF01), rewritten to `!` **in the composer** when leading (`！ls` → `!ls`, `！！`/`！!`/`!！` → `!!`); a `！` elsewhere stays punctuation (`你好！` never runs)
-- **Fullscreen quote** — in fullscreen mode, a mouse drag over the transcript only copies (pi's copy-on-select); press `Enter` while that selection is active to quote it into the composer as a Markdown blockquote (`> line`) followed by a blank line, with the caret ready for your question. Any other key dismisses the transcript selection, so a copy-only selection never hijacks a later Enter submitted with a draft. Only transcript selections are quoted (drags over the composer are ignored), and the gesture follows grok-build's block-viewer quote (`Enter` on a selected block) so the quoted material is visually distinct from the prompt
+A Codex-style composer: a filled panel with a bold `❯` prompt (green in `!bash` mode). `$skill` mentions highlight in the theme accent, and typing `$` opens a picker over every indexed skill (agents, codex, claude, pi); unknown tokens stay untouched. Chinese IME aliases `￥` → `$` and leading `！` → `!` are rewritten in place.
 
-**File:** `editor.ts`
+In fullscreen mode, `Enter` on a transcript selection quotes it into the composer as a Markdown blockquote with a blank line, ready for your question. Any other key dismisses the selection.
 
 ---
 
-### request-logger
+## auto-update.ts
 
-Logs every provider request to `~/.pi/agent/requests/<session>.request.log` — HTTP status, headers, token counts, model info, and the complete decoded request body (including gzip-compressed provider payloads) — with sensitive query parameters and auth headers sanitized.
+![auto-update](https://github.com/user-attachments/assets/16b9a2b2-3475-4861-8f93-b7703e875d73)
 
-**File:** `request-logger.ts`
+Checks pi itself and the extension packages on TUI startup. When updates exist it runs the matching `pi update` command in a separate process, pipes stdout/stderr so nothing touches the terminal or the composer, and appends the result to the transcript as a custom entry (not sent to the LLM). With no updates or a failed check it stays silent.
+
+The pi check uses the same endpoint, User-Agent, timeout and gates as pi's own `Update Available` banner. A new pi version needs a restart (the running process keeps its loaded modules); updated packages are picked up by `/reload`. `/ext-update` runs it for everything, `/ext-update <package>` for one package. Installation is `pi update`'s decision, so non-npm setups need [`selfUpdateCommand`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md) in `settings.json`.
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `PI_AUTO_UPDATE_EXTENSIONS` | `update` | `update` runs it, `check` only notifies, `off` skips the package check |
+| `PI_AUTO_UPDATE_PI` | `update` | Same three values for pi itself |
+| `PI_OFFLINE` / `PI_SKIP_VERSION_CHECK` | unset | Skip the startup check |
 
 ---
 
-### shortcuts
+## tool-tui.ts
 
-`Alt+C` copies the current editor content to the system clipboard. (Formerly `Ctrl+Shift+C`, which Windows Terminal intercepts for its own Copy action whenever any text is selected in the terminal — the key never reached pi in that state.)
+![tool-tui](https://github.com/user-attachments/assets/95f4eb91-b7e7-4afb-a483-9296e928b3ee)
 
-`Alt+K` / `Alt+J` jump to the previous / next **final assistant answer** in fullscreen mode. Each stop is the last qualifying assistant body of one user turn: user prompts, intermediate assistant messages that end in tool calls, and earlier retry/aborted partial replies are skipped. So with several queued prompts one press moves one prompt back or forward. At the first answer, `Alt+K` moves to its first line; past the last answer, `Alt+J` returns to the live end of the transcript.
+Devin-CLI style compact rows for `read`, `write`, `edit`, `bash` and `powershell`: one line per call with a status icon, the path or command, and the numbers that matter (`+12 -3`, `120 lines`, `(exit 1)`). Tool behavior is untouched and `Ctrl+O` still expands pi's original output.
 
-Pi's built-in `Ctrl+Shift+Up` / `Ctrl+Shift+Down` (`Ctrl+Up` / `Ctrl+Down` on Windows/WSL) already jumps between OSC 133 marked messages, but that includes the user message at the start of every turn — hence two stops per queued prompt. The `Alt+J/K` shortcuts use the same fullscreen renderer but only stop at final assistant replies.
+---
 
-**File:** `shortcuts.ts`
+## bash-default-timeout.ts
 
-#### Built-in keybindings (`~/.pi/agent/keybindings.json`)
+pi ships no default shell timeout, so a model that omits it can hang a tool call. This injects 60s (600s for installs, builds and test runs), fixes millisecond mixups (`180000` means 3 minutes, not 50 hours), and caps everything at 7200s. The `timeout` schema text and the rendered call are updated to match the deadline that actually applies.
 
-Beyond what this extension registers, the local config remaps two **pi built-in** actions to match codex-cli's input habits:
+The `tool_call` hook covers nested calls from codemode and subagents; `!command` runs are left alone. `powershell` is Windows-only.
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `PI_BASH_TIMEOUT_SECONDS` | `60` | Deadline injected when the model omits `timeout` |
+| `PI_BASH_LONG_TIMEOUT_SECONDS` | `600` | Deadline for installs, builds and test runs |
+| `PI_BASH_MAX_TIMEOUT_SECONDS` | `7200` | Hard ceiling applied to every value |
+| `PI_BASH_NO_MS_HEURISTIC` | unset | Keep millisecond-looking numbers as seconds |
+
+---
+
+## request-logger.ts
+
+Logs every provider request to `~/.pi/agent/requests/<session>.request.log` — HTTP status, headers, token counts, model info and the complete decoded body (including gzip payloads), with sensitive query parameters and auth headers sanitized.
+
+---
+
+## session-workbench.ts
+
+`Alt+H` / `/workbench` lists every user turn newest first; selecting one expands the user message plus the final reply, `Enter` opens the turn's step-by-step process, and `V` shows the final reply verbatim. A live activity line in the status bar shows the running tool or command.
+
+Keys: `↑↓` select · `PgUp`/`PgDn` scroll · `V` read reply · `Enter` detail · `C` copy · `Esc`/`Q` close
+
+---
+
+## theme-follow.ts
+
+On Windows Terminal (including WSL/ConPTY) and other terminals without `DECSET 2031`, pi's `system` theme does not follow live light/dark switches: user messages and the composer keep the startup palette while the rest of the UI changes. This extension fixes that.
+
+pi re-queries OSC 10/11/4 only on startup, `/reload`, or a `CSI ?997;1n|2n` report. Windows Terminal answers OSC 11 but never sends that report ([microsoft/terminal#18375](https://github.com/microsoft/terminal/issues/18375); [PR #20335](https://github.com/microsoft/terminal/pull/20335) rejected: apps should query `11;?` themselves).
+
+It polls the same color query every 3 seconds; when the answer changes it updates pi's live `terminalColors` in place and calls `setTheme("system")` to rebuild every token. Only active with `theme: "system"`.
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `PI_THEME_FOLLOW` | unset | Set to `off` to disable |
+| `PI_THEME_FOLLOW_POLL_MS` | `3000` | Interval between queries (`0` disables) |
+| `PI_THEME_FOLLOW_DELAY_MS` | `2000` | Delay before the first query, so pi's startup query finishes first |
+| `PI_THEME_FOLLOW_TIMEOUT_MS` | `150` | Per-query timeout |
+| `PI_THEME_FOLLOW_DEBUG` | unset | `1` logs every poll instead of just switches |
+
+Start, stop and switch events go to `~/.pi/agent/tmp/theme-follow.log`.
+
+---
+
+## 429-retry.ts
+
+![429 limit](https://github.com/user-attachments/assets/907d920d-5d20-4193-b298-416179fc0c69)
+
+Retries transient HTTP 429s from any provider: 5s → 10s → 20s → 30s → 60s → 90s … (up to 15 attempts), or the server's `Retry-After` / body reset time, with a live status-bar countdown. Permanent limits fail fast with the reset time; opencode usage-limit bodies are annotated with `resets_at` / `resets_in` so the TUI shows them. Devin 429s are handed back to the provider's own limiter instead of being retried.
+
+`/429-retry` toggles it, `/429-retry <seconds>` sets a fixed wait.
+
+---
+
+## thinking-level.ts
+
+![thinking-level /model picker](https://github.com/user-attachments/assets/f29e4266-933a-42c9-a712-e2ee0b75a475)
+
+Remembers the reasoning level per model and defaults each model to its highest supported level. Switching back restores it; a model without one is raised to its maximum rather than inheriting a lower level. `/model` lists supported levels with the current one highlighted.
+
+**Storage:** `~/.pi/agent/thinking-level-memory.json`
+
+---
+
+## shortcuts.ts
+
+`Alt+C` copies the editor content (Windows Terminal intercepts `Ctrl+Shift+C` whenever text is selected). `Alt+K` / `Alt+J` jump between final assistant answers in fullscreen mode, skipping user prompts and intermediate tool-call turns — unlike pi's built-in OSC 133 jumps, which stop twice per queued prompt.
+
+### Built-in keybindings
+
+`~/.pi/agent/keybindings.json` remaps two pi built-ins to match codex-cli:
 
 ```json
 {
@@ -147,56 +175,9 @@ Beyond what this extension registers, the local config remaps two **pi built-in*
 }
 ```
 
-| Action | Key here | pi default | codex-cli | Why |
-|---|---|---|---|---|
-| `app.message.followUp` — queue the draft as a follow-up (delivered after the current turn ends; plain `Enter` while streaming *steers* instead) | `Ctrl+Enter` | `Alt+Enter` (`Ctrl+Q` on Windows/WSL) | `composer.queue` = `Tab` | `Ctrl+Enter` is the usual "send/queue without interrupting" habit, and it frees `Alt+Enter` — codex binds that to a newline, and Windows Terminal grabs it for fullscreen (pi's own newline is `shift+enter`/`ctrl+j`, so nothing is lost) |
-| `app.message.dequeue` — pull the queued messages back into the editor | `Alt+↑` | `Alt+↑` (`Alt+Q` on Windows/WSL) | `chat.edit_queued_message` = `Alt+↑` (+ `Shift+←`) | Same chord as codex; written out explicitly so Windows/WSL also gets `Alt+↑` instead of pi's platform-specific `Alt+Q` default |
+| Action | Key here | pi default | Why |
+|---|---|---|---|
+| `app.message.followUp` — queue the draft (`Enter` while streaming steers instead) | `Ctrl+Enter` | `Alt+Enter` / `Ctrl+Q` | Usual "send without interrupting" chord; frees `Alt+Enter` |
+| `app.message.dequeue` — pull queued messages back | `Alt+↑` | `Alt+↑` / `Alt+Q` | Matches codex; explicit so WSL gets `Alt+↑` too |
 
-Two caveats, both from pi's own `docs/terminal-setup.md`:
-
-- `Ctrl+Enter` needs a terminal that reports modified Enter distinctly (Kitty keyboard protocol: Kitty, Ghostty, WezTerm, iTerm2, Windows Terminal, VS Code ≥1.109.5). xfce4-terminal and terminator cannot tell it apart from plain `Enter` — there the chord arrives as `Enter`, i.e. it steers instead of queueing.
-- After editing `keybindings.json`, run `/reload` in pi to apply it.
-
-**File:** `~/.pi/agent/keybindings.json` (not an extension)
-
----
-
-### session-workbench
-
-- **Live activity line** — the status bar shows the executing tool or command (`⏳ bash: npm run build`) and clears itself when the tool finishes.
-- **`Alt+H` / `/workbench`** — overlay list of every user message, newest first. Rows stay collapsed; the selected one expands in place to show the user message plus the assistant's final text reply only — thinking and tool calls stay hidden.
-- **`Enter`** — opens the selected turn's full process in `/tree` list style (one row per step, ✓/✗ per tool call). `Enter` again opens that step's content, the cursor lands on the first assistant reply, `g`/`G` jump to top/bottom.
-- **`V`** — reads the final reply verbatim (original line breaks, scrollable) for copying the answer without digging through the process.
-
-Keys: `↑↓` select · `PgUp`/`PgDn` scroll · `V` read reply · `Enter` detail · `C` copy · `Esc`/`Q` close
-
-**File:** `session-workbench.ts`
-
----
-
-### 429-retry
-
-![429 limit](https://github.com/user-attachments/assets/907d920d-5d20-4193-b298-416179fc0c69)
-
-Retries transient HTTP 429 responses automatically (any provider). The wait follows an incremental sequence — 5s, 10s, 20s, 30s, 60s, 90s, ... (+30s per retry after 30s), up to 15 attempts, or the server's `Retry-After` / body reset time when provided — with a live status-bar countdown. Hard limits fail fast: a wait longer than 10 min, or a provider's permanent-limit signature (e.g. workbuddy quota exhausted, opencode usage-limit errors), surfaces the response immediately with the reset time instead of retrying.
-
-OpenCode-specific: before an opencode.ai usage-limit 429 is handed back to the SDK, the response body is annotated with the server-provided reset time — `resets_at` in the codex TUI's format (`14:30` / `14:30 5 Mar`) plus the remaining duration `resets_in`, both top-level and inside `error`, with a `(Free usage limit resets at 14:30)` suffix appended to `error.message` — so the final error message the TUI displays carries the reset time (e.g. `{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later. (Free usage limit resets at 14:30)","resets_at":"14:30","resets_in":"8h 7m 17s"}`). Other providers keep the historical top-level `resets_in` only.
-
-Devin-specific: every `server.codeium.com` 429 is handed straight back to the provider instead of being retried by the fetch-layer backoff. Devin owns its own rolling 5-requests/60s limiter and waits for a slot transparently — retrying here would eat the five grace slots and push the reset further out.
-
-**Command:** `/429-retry` toggles on/off · `/429-retry <seconds>` sets a fixed wait time for every retry
-
-**File:** `429-retry.ts`
-
----
-
-### thinking-level
-
-![thinking-level /model picker](https://github.com/user-attachments/assets/f29e4266-933a-42c9-a712-e2ee0b75a475)
-
-Remembers the reasoning level **per model** and defaults each model to its highest supported level.
-
-- Switching back restores its remembered level; a model without one is raised to its maximum — never inheriting a lower level (a `high`-only model followed by a `max`-capable one lands on `max`). Fallback: scoped `--models model:level`.
-- `/model` lists the levels each model supports, current one highlighted. No commands, no switches.
-
-**Storage:** `~/.pi/agent/thinking-level-memory.json` · **File:** `thinking-level.ts`
+`Ctrl+Enter` needs a terminal that reports modified Enter distinctly (Kitty keyboard protocol); xfce4-terminal and terminator cannot. Run `/reload` after editing the file.
