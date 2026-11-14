@@ -17,7 +17,8 @@
 		"tool-tui.ts",
 		"status/",
 		"thinking-level.ts",
-		"session-workbench.ts"
+		"session-workbench.ts",
+		"theme-follow.ts"
 	],
 	"pi": {
 		"extensions": [
@@ -30,7 +31,8 @@
 			"./tool-tui.ts",
 			"./status/",
 			"./thinking-level.ts",
-			"./session-workbench.ts"
+			"./session-workbench.ts",
+			"./theme-follow.ts"
 		]
 	},
 	"peerDependencies": {
@@ -39,13 +41,14 @@
 		"@earendil-works/pi-tui": "*"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-ai": "^1.5.0",
-		"@earendil-works/pi-coding-agent": "^1.5.0",
-		"@earendil-works/pi-tui": "^1.5.0",
+		"@earendil-works/pi-ai": "^1.5.1",
+		"@earendil-works/pi-coding-agent": "^1.5.1",
+		"@earendil-works/pi-tui": "^1.5.1",
 		"@types/node": "^24.0.0",
 		"typescript": "^5.9.0"
 	},
 	"scripts": {
-		"check": "tsc -p tsconfig.json"
+		"check": "tsc -p tsconfig.json",
+		"test": "node --experimental-strip-types test/auto-update.test.mts && node --experimental-strip-types test/theme-follow.test.mts"
 	}
 }

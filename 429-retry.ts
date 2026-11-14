@@ -132,9 +132,10 @@ const RATE_LIMIT_RULES: RateLimitRule[] = [
     match: (url) => url.includes("server.codeium.com"),
     isTerminal: () => true,
   },
-  // trae-work: no trustworthy permanent-429 signature yet (code 1001 is an
-  // auth expiry handled by the trae plugin itself), so no rule -> default
-  // retry. Add a rule here once a signature is found.
+  // traecn (Trae CN, formerly "trae-work"): no trustworthy permanent-429
+  // signature yet (code 1001 is an auth expiry handled by the trae plugin
+  // itself), so no rule -> default retry. Add a rule here once a signature is
+  // found.
 ];
 
 // A server-requested wait longer than this is treated as a hard limit and
