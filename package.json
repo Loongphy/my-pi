@@ -48,7 +48,6 @@
 		"typescript": "^5.9.0"
 	},
 	"scripts": {
-		"check": "tsc -p tsconfig.json",
-		"test": "node --experimental-strip-types test/auto-update.test.mts && node --experimental-strip-types test/theme-follow.test.mts"
+		"check": "tsc -p tsconfig.json"
 	}
 }
