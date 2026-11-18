@@ -64,7 +64,7 @@ export const DEFAULT_STATUS_CONFIG: StatusLineConfig = {
     model: true,
     currentDir: true,
     gitBranch: true,
-    tokenStats: true,
+    tokenStats: false,
     cacheRate: true,
     contextUsage: true,
     tokenSpeed: true,
