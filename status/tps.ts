@@ -30,6 +30,13 @@ export class TokenSpeedEngine {
   private _providerTtftMs: number | undefined;
   private _providerTps: number | undefined;
 
+  // A bursty provider can stream the whole answer in one delta. The decode
+  // window then collapses to a few milliseconds and decode TPS becomes a
+  // phantom (thousands of tok/s). For the final render we fall back to the
+  // whole-turn rate (request start -> message end), which includes TTFT and is
+  // the only honest rate those providers expose.
+  private _wholeTurnTps = false;
+
   // Timing — excludes TTFT for TPS calculation
   private _messageStartTime = 0;
   private _httpRequestStartTime = 0;
@@ -42,8 +49,13 @@ export class TokenSpeedEngine {
 
   private readonly TPS_WINDOW_MS = 1000;
   private readonly COMPACTION_THRESHOLD = 5000;
+  private readonly BURST_WINDOW_MS = 250;
+  private readonly BURST_MIN_OUTPUT_TOKENS = 8;
 
   get isStreaming() { return this._isStreaming; }
+
+  /** True when `tps` is a whole-turn fallback, not a decode-window rate. */
+  get isWholeTurnTps() { return this._wholeTurnTps; }
 
   /** Best token count available: real provider-reported when finished, otherwise approx char/4. */
   get tokenCount(): number {
@@ -92,14 +104,23 @@ export class TokenSpeedEngine {
    * falling back to overall average when elapsed < 1 s.
    *
    * After finish(): uses provider-reported real output tokens and
-   * wall time from generation start (excludes TTFT).
+   * wall time from generation start (excludes TTFT). If the provider sent
+   * the whole answer in one burst, the decode window collapses and the
+   * engine falls back to the whole-turn rate instead; `isWholeTurnTps`
+   * lets the header mark that value with a `~`.
    */
   get tps(): number {
     // Provider-authoritative TPS wins once it is published.
     if (this._providerTps !== undefined) return this._providerTps;
 
-    // Finished — use real provider-reported tokens (time frozen at finish())
+    // Finished — use real provider-reported tokens (time frozen at finish()).
     if (this._finished && this._realOutputTokens > 0) {
+      if (this._wholeTurnTps) {
+        const wholeTurnMs = this._providerTtftMs !== undefined
+          ? this._providerTtftMs + (this._generationEndTime - this._generationStartTime)
+          : this._generationEndTime - this._messageStartTime;
+        return wholeTurnMs > 0 ? this._realOutputTokens / (wholeTurnMs / 1000) : 0;
+      }
       const elapsed = this.elapsedMs;
       const result = elapsed === 0 ? 0 : this._realOutputTokens / (elapsed / 1000);
       return result;
@@ -156,6 +177,7 @@ export class TokenSpeedEngine {
     this._ttftMs = 0;
     this._providerTtftMs = undefined;
     this._providerTps = undefined;
+    this._wholeTurnTps = false;
     this._tokenTimestamps = [];
     this._windowStartIndex = 0;
   }
@@ -213,6 +235,13 @@ export class TokenSpeedEngine {
     }
     this._providerTtftMs = providerTiming?.ttftMs;
     this._providerTps = providerTiming?.tps;
+    const decodeMs = this._generationEndTime - this._generationStartTime;
+    this._wholeTurnTps =
+      this._providerTps === undefined &&
+      this._realOutputTokens >= this.BURST_MIN_OUTPUT_TOKENS &&
+      this._generationStartTime > 0 &&
+      decodeMs > 0 &&
+      decodeMs < this.BURST_WINDOW_MS;
     // Keep stats alive so the final status render reads real TPS
   }
 
@@ -224,6 +253,7 @@ export class TokenSpeedEngine {
     this._generationEndTime = 0;
     this._providerTtftMs = undefined;
     this._providerTps = undefined;
+    this._wholeTurnTps = false;
     this._tokenTimestamps = [];
     this._windowStartIndex = 0;
   }

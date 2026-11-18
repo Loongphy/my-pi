@@ -369,7 +369,8 @@ export function buildStatusHeader(
 
         // 6. Token speed + TTFT (no separator between them, both accent colour)
         if (config.tokenSpeed && data.tokenSpeedEngine.tps > 0) {
-            let speedStr = `\u{F04C5} ${data.tokenSpeedEngine.tps.toFixed(0)} t/s`;
+            const tpsPrefix = data.tokenSpeedEngine.isWholeTurnTps ? "~" : "";
+            let speedStr = `\u{F04C5} ${tpsPrefix}${data.tokenSpeedEngine.tps.toFixed(0)} t/s`;
             if (config.ttft && data.tokenSpeedEngine.ttftSec > 0) {
                 speedStr += ` TTFT ${data.tokenSpeedEngine.ttftSec.toFixed(1)}s`;
             }
