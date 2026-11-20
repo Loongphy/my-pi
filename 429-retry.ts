@@ -188,8 +188,6 @@ export default function (pi: ExtensionAPI) {
   // State
   let enabled = true;
   let isRateLimited = false;
-  let lastRateLimitTime: number | null = null;
-  let retryCount = 0;
   // Fixed wait time explicitly set by the user via /429-retry <seconds>
   // (null = use the incremental sequence)
   let customWaitMs: number | null = null;
@@ -283,11 +281,6 @@ export default function (pi: ExtensionAPI) {
     return (base + (attempt - RETRY_WAIT_SEQUENCE_SECONDS.length) * 30) * 1000;
   }
 
-  /** Human-readable description of the current wait strategy (for the status bar) */
-  function describeWaitStrategy(): string {
-    return customWaitMs !== null ? `${customWaitMs / 1000}s` : "5,10,20,30,60,90...+30s each";
-  }
-
   /**
    * Find the ownership rule for a request URL (no match = undefined -> default retry).
    */
@@ -370,7 +363,7 @@ export default function (pi: ExtensionAPI) {
    */
   function setRateLimitLine(remainingSec: number, attempt: number, detail?: string): void {
     const suffix = detail ? ` - ${detail}` : "";
-    _ctx?.ui?.notify?.(
+    safeNotify(
       `Warning: Received 429 (Too Many Requests) - retry ${attempt}/${MAX_RETRIES} in ${remainingSec}s; disable with /429-retry off${suffix}`,
       "info"
     );
@@ -382,8 +375,23 @@ export default function (pi: ExtensionAPI) {
    */
   function clearRateLimitState(): void {
     isRateLimited = false;
-    retryCount = 0;
-    lastRateLimitTime = null;
+  }
+
+  /**
+   * Send a UI notification without letting it break the request it is about.
+   *
+   * The captured ctx goes stale between `session_shutdown` and the next
+   * `session_start` (and for any fetch still in flight across a `/new`,
+   * `/resume` or `/fork`), and reading `ctx.ui` on a stale ctx throws. The
+   * countdown runs once per second for up to 10 minutes, so an unguarded
+   * notify would kill the retry loop - and the request - mid-wait.
+   */
+  function safeNotify(message: string, level: "info" | "warning" | "error"): void {
+    try {
+      _ctx?.ui?.notify?.(message, level);
+    } catch {
+      /* stale ctx: the countdown still runs, only the line is missing */
+    }
   }
 
   /**
@@ -592,7 +600,7 @@ export default function (pi: ExtensionAPI) {
         // opencode 429: passthrough body.error.message to chat so the real
         // upstream reason stays visible even when the SDK only shows a code.
         if (opencodeDetail) {
-          _ctx?.ui?.notify?.(`429 ${opencodeDetail}`, "warning");
+          safeNotify(`429 ${opencodeDetail}`, "warning");
         }
         isRateLimited = false;
         // If the user aborted while we were annotating / deciding ownership,
@@ -612,8 +620,6 @@ export default function (pi: ExtensionAPI) {
 
       attempts++;
       isRateLimited = true;
-      lastRateLimitTime = Date.now();
-      retryCount = attempts;
 
       // Ensure the wait is at least 1 second and capped to avoid endless waits
       let actualWaitMs = Math.max(rawWaitMs, 1000);
@@ -654,7 +660,6 @@ export default function (pi: ExtensionAPI) {
     // If we were rate limited but now recovered, silently clear the state
     if (isRateLimited && response.status !== 429) {
       isRateLimited = false;
-      retryCount = 0;
     }
 
     return response;
@@ -682,20 +687,19 @@ export default function (pi: ExtensionAPI) {
    * Disable the fetch wrapper (restore the original fetch)
    */
   function disableWrapper() {
-    // Restore the original fetch (possibly request-logger's wrapper)
+    // Restore the original fetch (possibly request-logger's wrapper) as a plain
+    // writable data property: an accessor here used to swallow every later
+    // `globalThis.fetch = ...` (its setter wrote to a dead `_fetch` field), so a
+    // plugin that installs itself afterwards silently never ran.
+    const restored = currentFetch;
     Object.defineProperty(globalThis, "fetch", {
-      get() {
-        return currentFetch;
-      },
-      set(v) {
-        (globalThis as any)._fetch = v;
-      },
+      value: restored,
+      writable: true,
       configurable: true,
       enumerable: true,
     });
 
     isRateLimited = false;
-    retryCount = 0;
     lastAbortAt = null;
     lastAbortUrl = null;
   }
@@ -748,9 +752,17 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Initialize the context on session start
+  // Initialize the context on session start.
+  //
+  // This is also where the wrapper is (re)installed: pi emits `session_shutdown`
+  // for `/new`, `/resume`, `/fork` and `/reload`, not only for quitting, and an
+  // extension module is NOT re-imported when the session is merely replaced.
+  // Tearing the wrapper down on shutdown without restoring it here silently
+  // disabled 429 retries for the rest of the process.
   pi.on("session_start", async (_event, ctx) => {
     _ctx = ctx;
+    if (enabled) enableWrapper();
+    else disableWrapper();
   });
 
   // Listen for provider response events for extra logging
@@ -762,7 +774,8 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Cleanup: restore the original fetch on session shutdown
+  // Cleanup: hand the fetch chain back while this session's UI ctx is gone.
+  // `session_start` reinstalls the wrapper (see above).
   pi.on("session_shutdown", async () => {
     disableWrapper();
   });
