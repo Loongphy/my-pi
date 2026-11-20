@@ -206,6 +206,9 @@ export default function (pi: ExtensionAPI) {
   // Keep a reference to the current fetch (possibly request-logger's wrapper).
   // `let`: the setter below re-assigns it when someone overrides globalThis.fetch.
   let currentFetch = globalThis.fetch;
+  // Outermost wrapper someone else installed with `globalThis.fetch = ...`.
+  // See enableWrapper() - it goes ABOVE this interceptor, never underneath it.
+  let assignedFetch: typeof fetch | null = null;
 
   /**
    * Parse the wait time (ms) requested by the response.
@@ -671,12 +674,22 @@ export default function (pi: ExtensionAPI) {
   function enableWrapper() {
     Object.defineProperty(globalThis, "fetch", {
       get() {
-        return fetchWithRetry;
+        return assignedFetch ?? fetchWithRetry;
       },
       set(v) {
-        // If someone overrides fetch, update our underlying fetch
-        // so request-logger keeps working
-        (currentFetch as any) = v;
+        // `const orig = fetch; fetch = wrapper` captures THIS interceptor as
+        // `orig`. Storing the wrapper as our underlying fetch put it below its
+        // own `orig`, so every request recursed until the stack blew up. Keep
+        // the chain acyclic: caller → assigned wrapper → fetchWithRetry →
+        // currentFetch. Non-functions are ignored; assigning fetchWithRetry
+        // itself is the "unwrap" direction and drops the overlay.
+        if (typeof v !== "function") return;
+        if (v === fetchWithRetry) {
+          assignedFetch = null;
+          return;
+        }
+        if (v === assignedFetch) return;
+        assignedFetch = v;
       },
       configurable: true,
       enumerable: true,
@@ -687,11 +700,12 @@ export default function (pi: ExtensionAPI) {
    * Disable the fetch wrapper (restore the original fetch)
    */
   function disableWrapper() {
-    // Restore the original fetch (possibly request-logger's wrapper) as a plain
+    // Restore the next layer down (possibly request-logger's wrapper) as a plain
     // writable data property: an accessor here used to swallow every later
     // `globalThis.fetch = ...` (its setter wrote to a dead `_fetch` field), so a
-    // plugin that installs itself afterwards silently never ran.
-    const restored = currentFetch;
+    // plugin that installs itself afterwards silently never ran. A wrapper that
+    // was assigned while we were installed stays on top, not dropped.
+    const restored = assignedFetch ?? currentFetch;
     Object.defineProperty(globalThis, "fetch", {
       value: restored,
       writable: true,
@@ -765,13 +779,10 @@ export default function (pi: ExtensionAPI) {
     else disableWrapper();
   });
 
-  // Listen for provider response events for extra logging
-  pi.on("after_provider_response", (event, ctx) => {
+  // Keep the session ctx fresh during a run (the retry line and the 429 detail
+  // line both read it; after_provider_response fires inside the request).
+  pi.on("after_provider_response", (_event, ctx) => {
     _ctx = ctx;
-    if (event.status === 429) {
-      // Log the 429 event (actual retries are handled by the fetch wrapper)
-      console.log(`[429-retry] Detected 429 response at ${new Date().toISOString()}`);
-    }
   });
 
   // Cleanup: hand the fetch chain back while this session's UI ctx is gone.

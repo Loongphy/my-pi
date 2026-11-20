@@ -888,12 +888,28 @@ function markLogged(key: string): boolean {
 // Intercept fetch via Object.defineProperty
 // ============================================================
 
-let _underlyingFetch = globalThis.fetch;
+/** The real fetch this interceptor bottoms out at; never replaced. */
+const _underlyingFetch = globalThis.fetch;
+/**
+ * Outermost wrapper somebody else installed with `globalThis.fetch = ...`.
+ *
+ * The idiomatic wrap pattern is `const orig = fetch; fetch = (…a) => orig(…a)`,
+ * which captures THIS interceptor as `orig`. Such a wrapper therefore belongs
+ * ABOVE us: assigning it to `_underlyingFetch` put it underneath its own `orig`
+ * and every request recursed until the stack blew up (RangeError after ~1200
+ * frames). Keep the chain acyclic instead: caller → assigned wrapper →
+ * interceptedFetch → the real fetch.
+ */
+let _assignedFetch: typeof fetch | null = null;
+/** Single interceptor instance, so `fetch === fetch` and identity checks hold. */
+let _interceptedFetch: typeof fetch | null = null;
 
 if (typeof _underlyingFetch === "function") {
   Object.defineProperty(globalThis, "fetch", {
     get() {
-      return async function interceptedFetch(
+      if (_assignedFetch) return _assignedFetch;
+      if (_interceptedFetch) return _interceptedFetch;
+      _interceptedFetch = async function interceptedFetch(
         input: RequestInfo | URL,
         init?: RequestInit,
       ): Promise<Response> {
@@ -1167,9 +1183,20 @@ if (typeof _underlyingFetch === "function") {
           throw err;
         }
       };
+      return _interceptedFetch;
     },
     set(v) {
-      _underlyingFetch = v;
+      // Rebasing (see `_assignedFetch`): a wrapper that captured this interceptor
+      // as its `orig` goes on top of it. Non-functions are ignored so a bad
+      // assignment cannot break every later request; assigning the interceptor
+      // itself is the "unwrap" direction and drops the overlay.
+      if (typeof v !== "function") return;
+      if (v === _interceptedFetch) {
+        _assignedFetch = null;
+        return;
+      }
+      if (v === _assignedFetch) return;
+      _assignedFetch = v;
     },
     configurable: true,
     enumerable: true,
