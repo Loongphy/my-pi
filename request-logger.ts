@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
@@ -177,16 +177,6 @@ function decodeProviderBody(
     return buf.toString("utf-8");
   } catch {
     return null;
-  }
-}
-
-/** Pretty-print JSON bodies when possible, otherwise keep the raw text. */
-function formatFullBody(raw: string): string {
-  try {
-    const parsed = JSON.parse(raw);
-    return JSON.stringify(parsed, null, 2);
-  } catch {
-    return raw;
   }
 }
 
@@ -500,7 +490,7 @@ function startStallMonitor(): void {
   const intervalMs = Math.max(5, Math.min(30, Math.floor(STALL_WARN_S / 2))) * 1000;
   const timer = setInterval(() => {
     const now = Date.now();
-    for (const [seq, e] of inflight) {
+    for (const e of inflight.values()) {
       const idle = (now - e.lastProgress) / 1000;
       if (idle >= STALL_WARN_S && now - e.lastWarnAt >= STALL_WARN_S * 1000) {
         e.lastWarnAt = now;
@@ -592,10 +582,15 @@ function wrapStreamForDebug(response: Response, seq: number): Response {
           controller.enqueue(value);
         } catch (err) {
           dbgLog(`stream_error: ${err instanceof Error ? err.message : String(err)}`);
+          if (entry) inflight.delete(seq);
           controller.error(err);
         }
       },
       cancel(reason) {
+        // A cancelled body (SDK stops at [DONE] or the user pressed Esc) never
+        // reaches the `done` branch, so drop the in-flight entry here too -
+        // otherwise the stall monitor keeps reporting a request that is gone.
+        if (entry) inflight.delete(seq);
         reader?.cancel(reason).catch(() => {});
       },
     }, { highWaterMark: 0 });
@@ -672,6 +667,13 @@ const USAGE_FIELD_KEYS = new Set([
   // nested detail containers (kept so the raw dump shows their presence)
   "input_tokens_details", "output_tokens_details", "prompt_tokens_details",
   "completion_tokens_details", "promptTokensDetails",
+  // cache miss split (WorkBuddy/DeepSeek report hit+miss explicitly)
+  "prompt_cache_miss_tokens", "prompt_cache_write_tokens",
+  // thinking split (WorkBuddy spells it completion_thinking_tokens)
+  "completion_thinking_tokens",
+  // billing meter (WorkBuddy: credit + quota{percent,reset_at,shared_models})
+  // — the only place the upstream exposes what the request actually cost.
+  "credit", "quota", "percent", "reset_at", "shared_models",
 ]);
 
 /** True if a parsed SSE data object plausibly carries usage/cache info. */
@@ -745,6 +747,20 @@ function wrapStreamForUsage(response: Response, requestTs: string, model: string
     let lastRaw: unknown = null;       // last usage-bearing chunk (raw)
     let rawBytes = 0;
     let sawUsage = false;
+    let flushed = false;
+
+    // The consumer (OpenAI SDK) stops iterating at `[DONE]` and CANCELS the
+    // stream without ever reaching our `done` branch — so a flush that lives
+    // only in `pull()` never runs and the RESPONSE block keeps its
+    // "capturing from stream" placeholder forever. Flush from every terminal
+    // path (done / cancel / error), once.
+    function flushUsage(): void {
+      if (flushed || !sawUsage) return;
+      flushed = true;
+      try {
+        appendUsageLog(requestTs, model, lastFlat, lastRaw, rawBytes);
+      } catch { /* logging must never break the stream */ }
+    }
 
     const wrapped = new ReadableStream<Uint8Array>(
       {
@@ -756,9 +772,7 @@ function wrapStreamForUsage(response: Response, requestTs: string, model: string
               // Flush any trailing buffered line.
               if (buffer.trim()) scanLine(buffer);
               buffer = "";
-              if (sawUsage) {
-                appendUsageLog(requestTs, model, lastFlat, lastRaw, rawBytes);
-              }
+              flushUsage();
               controller.close();
               return;
             }
@@ -774,13 +788,13 @@ function wrapStreamForUsage(response: Response, requestTs: string, model: string
             controller.enqueue(value);
           } catch (err) {
             // Still try to log what we captured before the error.
-            if (sawUsage) {
-              try { appendUsageLog(requestTs, model, lastFlat, lastRaw, rawBytes); } catch { /* ignore */ }
-            }
+            flushUsage();
             controller.error(err);
           }
         },
         cancel(reason) {
+          // Normal end of an SSE stream: the SDK got `[DONE]` and cancelled.
+          flushUsage();
           reader?.cancel(reason).catch(() => {});
         },
       },
@@ -1142,8 +1156,12 @@ if (typeof _underlyingFetch === "function") {
             // Skip TUI notification for user-initiated aborts (Esc/Ctrl+C).
             // The error is still written to the log file for diagnostics.
             if (!aborted) {
-              const detail = rootCauseDetail(err);
-              _tuiCtx?.ui.notify(sanitizeError(errMsg), "error");
+              try {
+                _tuiCtx?.ui.notify(sanitizeError(errMsg), "error");
+              } catch {
+                /* ctx went stale (session replaced while the fetch was in
+                   flight) - never let the notification mask the real error */
+              }
             }
           }
           throw err;

@@ -212,11 +212,15 @@ function displayPath(value: unknown, cwd: string): string {
 	return shortenHome(value);
 }
 
+/** Spinners that are currently ticking; cleared wholesale when the session ends. */
+const liveSpinners = new Set<ToolTuiState>();
+
 function stopSpinner(state: ToolTuiState): void {
 	if (state.spinner) {
 		clearInterval(state.spinner);
 		state.spinner = undefined;
 	}
+	liveSpinners.delete(state);
 }
 
 function statusIcon(ctx: RenderContextLike, theme: Theme): string {
@@ -227,9 +231,16 @@ function statusIcon(ctx: RenderContextLike, theme: Theme): string {
 	if (ctx.isPartial) {
 		if (!ctx.state.spinner) {
 			ctx.state.spinnerFrame = 0;
+			liveSpinners.add(ctx.state);
 			ctx.state.spinner = setInterval(() => {
 				ctx.state.spinnerFrame = ((ctx.state.spinnerFrame ?? 0) + 1) % SPINNER_FRAMES.length;
-				ctx.invalidate();
+				try {
+					ctx.invalidate();
+				} catch {
+					// The row was torn down under us (session replaced mid-call); stop ticking
+					// instead of throwing out of a timer.
+					stopSpinner(ctx.state);
+				}
 			}, 100);
 		}
 		return theme.fg("warning", SPINNER_FRAMES[ctx.state.spinnerFrame ?? 0]);
@@ -490,6 +501,11 @@ function createShellRenderer(base: ToolRenderers | undefined, shellName: string)
 
 export default function (pi: ExtensionAPI) {
 	installTightSpacingPatch();
+	// A tool row can vanish while still partial (session replaced, aborted call),
+	// and a leaked 100ms interval would keep re-rendering a dead row forever.
+	pi.on("session_shutdown", () => {
+		for (const state of [...liveSpinners]) stopSpinner(state);
+	});
 	pi.registerToolRenderer((name, next): ToolRenderers | undefined => {
 		const base = next();
 		switch (name) {
