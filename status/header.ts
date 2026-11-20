@@ -14,7 +14,7 @@
 
 import path from "node:path";
 import fs from "node:fs";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import type {
     ExtensionAPI,
     ExtensionContext,

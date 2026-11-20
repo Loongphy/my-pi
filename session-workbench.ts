@@ -42,13 +42,6 @@ import { execSync, spawnSync } from "node:child_process";
 import { platform } from "node:os";
 import { readFileSync } from "node:fs";
 
-// ═══════════════════════════════════════════════════════════════
-// Status bar: live label for the currently executing tool/command,
-// cleared automatically when it finishes
-// ═══════════════════════════════════════════════════════════════
-
-const STATUS_KEY = "workbench.activity";
-
 function summarizeArgs(toolName: string, args: unknown): string {
 	try {
 		const a = (args ?? {}) as Record<string, unknown>;

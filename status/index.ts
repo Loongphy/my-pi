@@ -155,7 +155,6 @@ function createInitialState(): AppState {
 // Ordering follows Map insertion order; set a status to undefined to leave.
 
 const FOOTER_SLOT_SEPARATOR = " · ";
-const FOOTER_SLOT_KEYS = Symbol.for("pi.status.footerSlotKeys") as symbol;
 
 /**
  * Optional allow/deny list for footer slots, read from the statusline config:
