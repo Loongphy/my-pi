@@ -32,10 +32,6 @@
  *   PI_THEME_FOLLOW_POLL_MS=3000       interval between queries (0 = disable)
  *   PI_THEME_FOLLOW_DELAY_MS=2000      delay before the first query
  *   PI_THEME_FOLLOW_TIMEOUT_MS=150     per-query timeout (matches pi's own 100 ms)
- *   PI_THEME_FOLLOW_DEBUG=1            log every poll, not just switches
- *
- * A short log is written to ~/.pi/agent/tmp/theme-follow.log on start, on each applied switch,
- * and when polling stops, so the behaviour is verifiable without a debugger.
  *
  * ── Caveats ────────────────────────────────────────────────────────────────
  * - Only active while the current theme is `system`. Explicit themes and `light/dark` pairs are
@@ -43,20 +39,16 @@
  * - `Theme.resolvedColors.terminal` is a private field. It is the same object reference pi's
  *   theme module holds in `terminalColors`, so mutating it in place (never replacing it) makes a
  *   subsequent `setTheme("system")` regenerate every token from the new colors. If a future pi
- *   changes that layout, the extension logs a warning and disables itself instead of breaking.
+ *   changes that layout, the extension disables itself instead of breaking.
  * - `setTheme("system")` may persist `"theme": "system"` into settings.json for users who never
  *   set a theme explicitly. That is exactly pi's default, and this repo already sets it.
  */
 
-import { appendFileSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Component, RgbColor, TerminalColors, TUI } from "@earendil-works/pi-tui";
 
 const WIDGET_KEY = "theme-follow.capture";
 const EMPTY_COMPONENT: Component = { render: () => [], invalidate: () => {} };
-const LOG_PATH = join(homedir(), ".pi", "agent", "tmp", "theme-follow.log");
 
 const SYSTEM_THEME = "system";
 const MAX_EMPTY_REPLIES = 3;
@@ -72,16 +64,6 @@ const DISABLED = process.env.PI_THEME_FOLLOW === "off" || process.env.PI_THEME_F
 const POLL_MS = intEnv("PI_THEME_FOLLOW_POLL_MS", 3000, 0);
 const START_DELAY_MS = intEnv("PI_THEME_FOLLOW_DELAY_MS", 2000, 0);
 const QUERY_TIMEOUT_MS = intEnv("PI_THEME_FOLLOW_TIMEOUT_MS", 150, 50);
-const DEBUG = process.env.PI_THEME_FOLLOW_DEBUG === "1";
-
-function log(message: string): void {
-	try {
-		mkdirSync(dirname(LOG_PATH), { recursive: true });
-		appendFileSync(LOG_PATH, `${new Date().toISOString()} ${message}\n`);
-	} catch {
-		// Logging must never break the session.
-	}
-}
 
 // ── Color comparison ────────────────────────────────────────────────────────
 
@@ -196,27 +178,17 @@ function captureTui(ctx: ExtensionContext): TUI | undefined {
 // ── Poll loop ───────────────────────────────────────────────────────────────
 
 function startFollowing(ctx: ExtensionContext): (() => void) | undefined {
-	if (POLL_MS <= 0 || DISABLED) {
-		log("disabled (PI_THEME_FOLLOW / PI_THEME_FOLLOW_POLL_MS)");
-		return undefined;
-	}
+	if (POLL_MS <= 0 || DISABLED) return undefined;
 	if (ctx.mode !== "tui" || !ctx.hasUI) return undefined;
 
 	const theme = ctx.ui.theme as unknown as ThemeLike;
-	if (theme.name && theme.name !== SYSTEM_THEME) {
-		log(`skipped: active theme is "${theme.name}", not "system"`);
-		return undefined;
-	}
+	if (theme.name && theme.name !== SYSTEM_THEME) return undefined;
 
 	const tui = captureTui(ctx);
-	if (!tui) {
-		log("skipped: could not capture the TUI instance");
-		return undefined;
-	}
+	if (!tui) return undefined;
 
 	const setTheme = (name: string): void => {
-		const result = ctx.ui.setTheme(name);
-		if (!result.success) log(`setTheme("${name}") failed: ${result.error ?? "unknown error"}`);
+		ctx.ui.setTheme(name);
 	};
 
 	let disposed = false;
@@ -225,38 +197,29 @@ function startFollowing(ctx: ExtensionContext): (() => void) | undefined {
 	let startTimer: ReturnType<typeof setTimeout> | undefined;
 	let interval: ReturnType<typeof setInterval> | undefined;
 
-	const stop = (reason: string): void => {
+	const stop = (): void => {
 		if (disposed) return;
 		disposed = true;
 		if (startTimer) clearTimeout(startTimer);
 		if (interval) clearInterval(interval);
-		log(`stopped (${reason})`);
 	};
 
 	const applyUnsafe = (reported: TerminalColors): void => {
 		if (!reported.background) {
 			// A timed-out or ConPTY-truncated query. Do not accumulate pending queries forever.
 			emptyReplies++;
-			if (DEBUG) log(`empty reply ${emptyReplies}/${MAX_EMPTY_REPLIES}`);
 			if (emptyReplies >= MAX_EMPTY_REPLIES) {
-				stop("terminal did not answer OSC 10/11/4; use PI_THEME_FOLLOW=off to silence this");
+				// Terminal did not answer OSC 10/11/4; PI_THEME_FOLLOW=off silences it.
+				stop();
 			}
 			return;
 		}
 		emptyReplies = 0;
 
 		const result = syncThemeFromTerminalColors(ctx.ui.theme as unknown as ThemeLike, reported, setTheme);
-		if (result.applied) {
-			const bg = reported.background;
-			log(
-				`switched: bg=#${[bg.r, bg.g, bg.b].map((v) => Math.round(v).toString(16).padStart(2, "0")).join("")}` +
-					` palette=${reported.palette ? `${reported.palette.length} colors` : "unchanged"}`,
-			);
-		} else if (DEBUG || result.reason === "no-resolved-colors") {
-			log(`no change (${result.reason})`);
-		}
 		if (result.reason === "no-resolved-colors") {
-			stop("pi's Theme.resolvedColors layout changed; extension needs updating");
+			// pi's Theme.resolvedColors layout changed; the extension needs updating.
+			stop();
 		}
 	};
 
@@ -264,9 +227,8 @@ function startFollowing(ctx: ExtensionContext): (() => void) | undefined {
 		if (disposed) return;
 		try {
 			applyUnsafe(reported);
-		} catch (error) {
+		} catch {
 			// A theme torn down by a concurrent /reload must never reject the poll promise.
-			log(`apply failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	};
 
@@ -297,14 +259,13 @@ function startFollowing(ctx: ExtensionContext): (() => void) | undefined {
 		}
 	};
 
-	log(`started (poll=${POLL_MS}ms, delay=${START_DELAY_MS}ms, timeout=${QUERY_TIMEOUT_MS}ms)`);
 	startTimer = setTimeout(() => {
 		if (disposed) return;
 		tick();
 		interval = setInterval(tick, POLL_MS);
 	}, START_DELAY_MS);
 
-	return () => stop("session ended");
+	return () => stop();
 }
 
 export default function (pi: ExtensionAPI): void {
