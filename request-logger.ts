@@ -18,7 +18,9 @@ const REQUESTS_DIR = resolve(homedir(), ".pi", "agent", "requests");
 //   - fetch: TTFB, per-chunk stream timing (pause >= 2s logged), stream totals
 //   - abort / network-error details (name, code, aborted flag)
 //   - pi events: agent_start/end, turn_start/end, message_start/update/end
-//     (update throttled to 5s), tool_execution_start/end, input
+//     (update throttled to 5s), tool_execution_start/end, input,
+//     after_provider_response (status + whether pi will retry it; retryable
+//     failures get no toast, terminal ones are deduped)
 // This makes it possible to tell WHERE a "Working..." hang is stuck:
 //   - [WARN] request stalled ... waiting for response headers
 //     => fetch() itself never resolved (network / server never replied)
@@ -873,6 +875,36 @@ function formatErrorForTui(status: number, body: string, maxLen = 200): string {
   return `HTTP ${status}: ${cleaned.slice(0, maxLen)}…`;
 }
 
+/**
+ * pi retries these HTTP statuses itself (packages/ai/src/utils/provider-retry.ts):
+ * 408, 409, 429 and 5xx, unless the server sets `x-should-retry`.
+ *
+ * Since pi 1.6.1 `after_provider_response` also fires for HTTP errors and for every
+ * retried attempt, so one failing request can report the same status several times.
+ * Retried failures get no toast: pi shows the retry and, if it stays broken, the final
+ * provider error in the chat. Only terminal errors are worth an immediate notification.
+ */
+function willBeRetried(status: number, headers: Record<string, string> | undefined): boolean {
+  const hint = headers?.["x-should-retry"];
+  if (hint === "true") return true;
+  if (hint === "false") return false;
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+/** Show the same terminal provider error at most once per minute (duplicate events are possible). */
+const ERROR_NOTICE_DEDUPE_MS = 60_000;
+const recentErrorNotices = new Map<string, number>();
+function markErrorNotified(status: number, body: string): boolean {
+  const now = Date.now();
+  for (const [key, at] of recentErrorNotices) {
+    if (now - at >= ERROR_NOTICE_DEDUPE_MS) recentErrorNotices.delete(key);
+  }
+  const key = `${status}|${body.slice(0, 512)}`;
+  if (recentErrorNotices.has(key)) return false;
+  recentErrorNotices.set(key, now);
+  return true;
+}
+
 const recentLogs = new Set<string>();
 function markLogged(key: string): boolean {
   if (recentLogs.has(key)) return false;
@@ -1229,18 +1261,31 @@ export default function (pi: ExtensionAPI): void {
   });
 
   // after_provider_response: show TUI notification for non-2xx provider HTTP responses
-  // Fires after HTTP response received, before stream consumed — body already cached by fetch interceptor
+  // Fires after HTTP response received, before stream consumed — body already cached by fetch interceptor.
+  // Since pi 1.6.1 it also fires for error responses and for each retried attempt (see willBeRetried).
   pi.on("after_provider_response", (event, ctx) => {
     _tuiCtx = ctx;
     dbgLog(`after_provider_response: status=${event.status} (handler fired)`);
 
-    if (event.status < 200 || event.status >= 300) {
-      const body = _lastErrorBody;
+    if (event.status >= 200 && event.status < 300) {
       _lastErrorBody = "";
-      ctx.ui.notify(formatErrorForTui(event.status, body), "error");
-    } else {
-      _lastErrorBody = "";
+      return;
     }
+
+    const body = _lastErrorBody;
+    _lastErrorBody = "";
+
+    if (willBeRetried(event.status, event.headers)) {
+      dbgLog(`after_provider_response: status=${event.status} will be retried — no toast`);
+      return;
+    }
+
+    const message = formatErrorForTui(event.status, body);
+    if (!markErrorNotified(event.status, message)) {
+      dbgLog(`after_provider_response: duplicate error toast suppressed (${event.status})`);
+      return;
+    }
+    ctx.ui.notify(message, "error");
   });
 
   // Log session start — create per-session file.
