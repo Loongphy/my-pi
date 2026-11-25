@@ -1,7 +1,16 @@
 /**
  * Codex Composer + `$skill` Mention Highlighting
  *
- * Two features layered on the pi input editor:
+ * Features layered on the pi input editor:
+ *
+ * ── Pasted images as Codex-style chips ─────────────────────────────────────
+ * pi core writes a clipboard image to a temp file and inserts that path into
+ * the composer. Codex instead shows an `[Image #N]` chip and attaches the
+ * image itself to the prompt. The composer keeps the path in a small registry,
+ * replaces the inserted path with the chip, highlights the chip like a skill
+ * mention, and turns the chip back into an image block when the prompt is
+ * submitted. The chip is plain text in the draft, so editing, undo, history,
+ * copy and queueing all keep working; only this extension knows the mapping.
  *
  * ── 1. Codex Composer restyle ──────────────────────────────────────────────
  * The default pi editor draws its chrome as top/bottom `─` border lines. Codex
@@ -96,7 +105,7 @@
  * rebuilds it. Rendering is ANSI-aware: tokens keep their highlight even when
  * the editor's inverted cursor sits on a character inside the token.
  *
- * ── 3. Fullscreen selection quoting ────────────────────────────────────────
+ * ── 4. Fullscreen selection quoting ────────────────────────────────────────
  * In fullscreen mode pi owns mouse selection (the transcript is not the
  * terminal emulator's scrollback), and a plain drag release only copies — which
  * is all a user who just wants the clipboard needs. Pressing `Enter` while a
@@ -123,6 +132,7 @@
  * Usage: pi --extension ./examples/extensions/codex-composer.ts
  */
 
+import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, type Dirent } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -145,6 +155,7 @@ import {
 	type SelectListLayoutOptions,
 	type TUI,
 	matchesKey,
+	isKeyRelease,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 
@@ -1001,6 +1012,39 @@ export function highlightSkillTokens(line: string, index: Map<string, SkillEntry
 }
 
 /**
+ * Highlight every `[Image #N]` chip on a rendered editor row, using the theme's
+ * accent color and bold — the same visual weight as a `$skill` mention, but a
+ * single color because every chip means the same thing. The row may already
+ * contain ANSI (cursor inversion, panel fill); spans are found on the visible
+ * text and mapped back to raw offsets, and the style is re-asserted after a
+ * full reset inside the span so a cursor on the token cannot break it.
+ */
+export function highlightImageTokens(line: string, theme: Theme): string {
+	if (!line.includes("[Image #")) return line;
+
+	const { visible, toRaw } = buildVisibleMap(line);
+	const spans: Array<{ start: number; end: number }> = [];
+	IMAGE_TOKEN_RE.lastIndex = 0;
+	let match: RegExpExecArray | null;
+	while ((match = IMAGE_TOKEN_RE.exec(visible)) !== null) {
+		const start = toRaw[match.index]!;
+		const end = toRaw[match.index + match[0].length - 1]! + 1;
+		spans.push({ start, end });
+	}
+	if (spans.length === 0) return line;
+
+	const prefix = `\x1b[1m${theme.getFgAnsi("accent")}`;
+	const suffix = "\x1b[22m\x1b[39m";
+	let out = line;
+	for (let s = spans.length - 1; s >= 0; s--) {
+		const span = spans[s]!;
+		const token = out.slice(span.start, span.end).replace(/\x1b\[0m/g, `\x1b[0m${prefix}`);
+		out = out.slice(0, span.start) + prefix + token + suffix + out.slice(span.end);
+	}
+	return out;
+}
+
+/**
  * Tint a whole editor row with the theme's `bashMode` color — the same green
  * pi paints the editor border with in bash mode, and the same token the `❯`
  * prompt uses. Bash mode is all-or-nothing (it starts at the first `!` and
@@ -1155,6 +1199,124 @@ function readTranscriptSelection(tui: TUI, composer?: unknown): string | undefin
 }
 
 // ============================================================================
+// Pasted images: Codex-style `[Image #N]` chips
+// ============================================================================
+
+/**
+ * pi core names a clipboard image `pi-clipboard-<uuid>.<ext>` in the OS temp
+ * directory and inserts the absolute path into the focused editor. Only that
+ * exact shape is treated as a pasted image; an ordinary path the user typed
+ * stays text.
+ */
+const CLIPBOARD_IMAGE_PATH_RE = /^(?:[A-Za-z]:)?[\\/].*pi-clipboard-[0-9a-fA-F-]+\.(png|jpe?g|webp|gif)$/;
+const CLIPBOARD_IMAGE_IN_TEXT_RE =
+	/(^|[\s(])((?:[A-Za-z]:)?[\\/][^\s"'()]*pi-clipboard-[0-9a-fA-F-]+\.(?:png|jpe?g|webp|gif))(?=$|[\s)])/g;
+const IMAGE_TOKEN_RE = /\[Image #(\d+)\]/g;
+
+type PastedImage = { path: string; mimeType: string };
+
+/** Chip id -> temp file. Kept for the life of the process so queueing, undo
+ *  and a restored draft can all resolve the same chip. */
+const pastedImageById = new Map<number, PastedImage>();
+const pastedImageIdByPath = new Map<string, number>();
+let nextPastedImageId = 1;
+
+function imageMimeTypeFromPath(filePath: string): string {
+	switch (filePath.slice(filePath.lastIndexOf(".") + 1).toLowerCase()) {
+		case "jpg":
+		case "jpeg":
+			return "image/jpeg";
+		case "webp":
+			return "image/webp";
+		case "gif":
+			return "image/gif";
+		default:
+			return "image/png";
+	}
+}
+
+/** The path when `text` is exactly one clipboard-image path (and nothing else). */
+function clipboardImagePath(text: string): PastedImage | undefined {
+	if (text !== text.trim()) return undefined;
+	if (!CLIPBOARD_IMAGE_PATH_RE.test(text)) return undefined;
+	return { path: text, mimeType: imageMimeTypeFromPath(text) };
+}
+
+/** Register a path once and return its chip id; a restored draft reuses it. */
+function imageIdFor(filePath: string): number {
+	const existing = pastedImageIdByPath.get(filePath);
+	if (existing !== undefined) return existing;
+	const id = nextPastedImageId++;
+	pastedImageById.set(id, { path: filePath, mimeType: imageMimeTypeFromPath(filePath) });
+	pastedImageIdByPath.set(filePath, id);
+	return id;
+}
+
+function imageToken(id: number): string {
+	return `[Image #${id}]`;
+}
+
+/** Turn clipboard-image paths in a restored draft back into their chips. */
+function tokenizeClipboardImagePaths(text: string): string {
+	if (!text.includes("pi-clipboard-")) return text;
+	return text.replace(CLIPBOARD_IMAGE_IN_TEXT_RE, (_whole, prefix: string, filePath: string) => {
+		return `${prefix}${imageToken(imageIdFor(filePath))}`;
+	});
+}
+
+/** Text MIME types Windows Terminal pastes by itself. */
+function hasTextClipboardType(types: readonly string[]): boolean {
+	return types.some((type) => {
+		const base = type.split(";")[0]!.trim().toLowerCase();
+		return base.startsWith("text/") || base === "string" || base === "utf8_string" || base === "text";
+	});
+}
+
+/**
+ * Whether the clipboard holds an image and no text at all. That is the case in
+ * which Windows Terminal's own Ctrl+V has nothing to paste, so it swallows the
+ * key press and the application only ever sees the key release. A clipboard
+ * with both (Office copies text plus a picture) is left to Windows Terminal:
+ * it already pastes the text, and pasting the image again would duplicate it.
+ *
+ * Only the Linux/WSL backends are probed here: wl-paste and xclip are the same
+ * tools pi's own image reader uses, and their `--list-types` is fast enough to
+ * run from a key handler. Native Windows keeps using Alt+V (or the press event
+ * when Windows Terminal does not take it).
+ */
+function clipboardHasOnlyImage(): boolean {
+	if (process.platform !== "linux") return false;
+
+	const probes: Array<[string, string[]]> = [];
+	if (process.env.WAYLAND_DISPLAY) probes.push(["wl-paste", ["--list-types"]]);
+	if (process.env.DISPLAY) probes.push(["xclip", ["-selection", "clipboard", "-t", "TARGETS", "-o"]]);
+
+	for (const [command, args] of probes) {
+		let output: string;
+		try {
+			output = execFileSync(command, args, {
+				encoding: "utf8",
+				timeout: 300,
+				stdio: ["ignore", "pipe", "ignore"],
+			});
+		} catch {
+			continue;
+		}
+
+		const types = output
+			.split(/\r?\n/)
+			.map((type) => type.trim())
+			.filter(Boolean);
+		const hasImage = types.some((type) => type.split(";")[0]!.trim().toLowerCase().startsWith("image/"));
+		// The first working backend is authoritative; a stale X11 clipboard must
+		// not make a Wayland image look like text.
+		return hasImage && !hasTextClipboardType(types);
+	}
+
+	return false;
+}
+
+// ============================================================================
 // Editor
 // ============================================================================
 
@@ -1163,6 +1325,15 @@ export class CodexComposer extends CustomEditor {
 	private skillIndex: Map<string, SkillEntry>;
 	/** Last caret/token state probed by probeSkillAutocomplete (dedupe). */
 	private lastAutocompleteProbe = "";
+	/** Windows Terminal turns Ctrl+V into its own paste action and never sends
+	 *  the key press to the application. It does send the Kitty key release, so
+	 *  opt into releases and use that one to read an image-only clipboard (the
+	 *  only case where WT's paste had nothing to paste). */
+	public wantsKeyRelease = true;
+	/** When a Ctrl+V press reached the editor, so its release must not paste
+	 *  the same image a second time. Windows Terminal normally swallows the
+	 *  press (its paste action) and forwards only the release. */
+	private ctrlVPressedAt = 0;
 
 	constructor(
 		tui: TUI,
@@ -1276,6 +1447,38 @@ export class CodexComposer extends CustomEditor {
 	}
 
 	/**
+	 * pi core inserts a clipboard image as its absolute temp path. Replace that
+	 * path with a chip and keep the path in the registry the input handler reads
+	 * on submit. Spacing follows core's file-paste rule so two pastes read
+	 * `[Image #1] [Image #2]` instead of running together.
+	 */
+	override insertTextAtCursor(text: string): void {
+		const image = clipboardImagePath(text);
+		if (!image || isBashModeText(this.getText())) {
+			super.insertTextAtCursor(text);
+			return;
+		}
+
+		const id = imageIdFor(image.path);
+		const { line, col } = this.getCursor();
+		const current = this.getLines()[line] ?? "";
+		const before = col > 0 ? current[col - 1] : "";
+		const after = col < current.length ? current[col] : "";
+		const lead = before && !/\s/.test(before) ? " " : "";
+		const trail = after && !/\s/.test(after) ? " " : "";
+		super.insertTextAtCursor(`${lead}${imageToken(id)}${trail}`);
+	}
+
+	/**
+	 * A draft restored from a session saved by vanilla pi can still hold the old
+	 * temp-path form. Turn those paths back into chips so their images survive
+	 * the restore; chips already in the draft are left alone.
+	 */
+	override setText(text: string): void {
+		super.setText(tokenizeClipboardImagePaths(text));
+	}
+
+	/**
 	 * Swap a fullwidth mention sigil for the canonical `$` the instant the token
 	 * under it names an indexed skill — `￥coss` becomes `$coss` as the last `s`
 	 * is typed, with the caret untouched. The rewrite is one code unit for one,
@@ -1345,12 +1548,40 @@ export class CodexComposer extends CustomEditor {
 	}
 
 	/**
+	 * Windows Terminal handles Ctrl+V itself and swallows the key press. With
+	 * the Kitty keyboard protocol active it still sends the release, which is
+	 * the only Ctrl+V event an application can see there. When the clipboard
+	 * holds an image and no text, WT's paste did nothing, so turn that release
+	 * into pi's image paste. Text (or text plus image) pastes were already done
+	 * by WT; doing nothing keeps them from being inserted twice. A press that
+	 * did reach the editor (WT did not claim it) is left to the normal binding,
+	 * and its release is ignored.
+	 */
+	private handleCtrlVRelease(): void {
+		if (this.ctrlVPressedAt !== 0 && Date.now() - this.ctrlVPressedAt < 500) {
+			this.ctrlVPressedAt = 0;
+			return;
+		}
+		if (clipboardHasOnlyImage()) {
+			this.onPasteImage?.();
+		}
+	}
+
+	/**
 	 * Enter with a fullscreen transcript selection quotes it into the composer
 	 * as a Markdown blockquote, instead of submitting the draft. A plain mouse
 	 * drag still only copies (pi's copy-on-select), so selecting text for the
 	 * clipboard is never turned into a prompt quote by accident.
 	 */
 	override handleInput(data: string): void {
+		// We opt into key releases only for the Windows Terminal Ctrl+V workaround.
+		// Swallow every release so no keybinding fires a second time on key-up.
+		if (isKeyRelease(data)) {
+			if (matchesKey(data, "ctrl+v")) this.handleCtrlVRelease();
+			return;
+		}
+		if (matchesKey(data, "ctrl+v")) this.ctrlVPressedAt = Date.now();
+
 		const tui = this.tui;
 		// `\n` is Shift+Enter / Ctrl+J (newline) in the editor's own parser even
 		// when the legacy key matcher also calls it Enter; never turn that into a
@@ -1475,6 +1706,15 @@ export class CodexComposer extends CustomEditor {
 		return `${bg}${row}${pad}${RESET_BG}`;
 	}
 
+	// Highlight `[Image #N]` chips on the text rows. The chips are plain text in
+	// the draft; this pass only styles them, and the input handler turns them
+	// back into image blocks on submit.
+	private highlightImages(lines: string[], bottomBorder: number): void {
+		for (let i = 1; i < bottomBorder; i++) {
+			lines[i] = highlightImageTokens(lines[i], this.piTheme);
+		}
+	}
+
 	// Highlight `$skill` mentions on the text rows (between the top border and
 	// the bottom border; autocomplete rows rendered below stay untouched).
 	private highlightSkills(lines: string[], bottomBorder: number): void {
@@ -1553,6 +1793,7 @@ export class CodexComposer extends CustomEditor {
 				lines[i] = highlightBashText(lines[i], this.piTheme);
 			}
 		} else {
+			this.highlightImages(lines, bottomBorder);
 			this.highlightSkills(lines, bottomBorder);
 		}
 
@@ -1567,7 +1808,51 @@ export class CodexComposer extends CustomEditor {
 }
 
 export default function (pi: ExtensionAPI) {
+	/**
+	 * Resolve the chips in a submitted draft back to image blocks. pi core
+	 * passes text only (the editor never held the bytes), so this is where a
+	 * `[Image #N]` becomes an actual attachment. Chips whose temp file is gone
+	 * stay as plain text instead of failing the prompt.
+	 */
+	pi.on("input", (event) => {
+		if (event.source !== "interactive" || !event.text.includes("[Image #")) return;
+
+		const ids = new Set<number>();
+		IMAGE_TOKEN_RE.lastIndex = 0;
+		for (const match of event.text.matchAll(IMAGE_TOKEN_RE)) {
+			ids.add(Number(match[1]));
+		}
+		if (ids.size === 0) return;
+
+		const images = [...(event.images ?? [])];
+		let added = 0;
+		for (const id of ids) {
+			const image = pastedImageById.get(id);
+			if (!image) continue;
+			try {
+				images.push({
+					type: "image",
+					data: readFileSync(image.path).toString("base64"),
+					mimeType: image.mimeType,
+				});
+				added++;
+			} catch {
+				// The temp file may have been cleaned up; keep the chip as text.
+			}
+		}
+		if (added === 0) return;
+		return { action: "transform" as const, text: event.text, images };
+	});
+
 	pi.on("session_start", (_event, ctx) => {
+		// A new session starts its chips at #1 again. Only clear when the editor
+		// is empty: `/reload` can keep a draft whose chips already map to files.
+		if (!ctx.ui.getEditorText().trim()) {
+			pastedImageById.clear();
+			pastedImageIdByPath.clear();
+			nextPastedImageId = 1;
+		}
+
 		// ctx.ui.theme is a live reference: it tracks runtime theme switches.
 		const theme = ctx.ui.theme;
 		// Patch `userMessageBg` before the first frame so replayed history is
